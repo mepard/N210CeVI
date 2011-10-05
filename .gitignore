@@ -1,0 +1,17 @@
+# Mac OS X Finder data
+.DS_Store
+
+# Netatalk
+.AppleDouble
+._*
+
+# ISE build stuff
+build
+build-*
+iseconfig
+_xmsgs
+**.gise
+
+# Mercurial stuff
+.hg/
+.hgignore

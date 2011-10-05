@@ -1,0 +1,4 @@
+Xilinx ISE notes
+
+
+<top module>.syr	is text version of the SYnthesis Report

@@ -1,0 +1,59 @@
+100 Msps Receive Support for USRP N210
+======================================
+
+To receive at 100 Msps, you'll need to load a modified FPGA image onto the N210 and
+use a UHD library that has been modified.
+
+The pre-build FPGA image was configured for N210 revisions 2 or 3. The ISE project and 
+top module require modification for other revisions.
+
+It is based on UHD-images-003.002.003, compatibility version 7.3.
+
+The FPGA has no transmit logic, so it can only receive. We've tested it with a DBSRX2,
+but other daughterboards should work.
+
+In the modified FPGA, DSP 0 is unchanged and can be used for normal decimation to 25 Msps
+or below. DSP 1 only supports 100 Msps.
+
+Normally, UHD only uses DSP 1 for multi-channel receives. The modified usrp2_impl.cpp 
+uses the environment variable UHD_SWAP_RX_DSPS to get access to DSP 1.
+
+To switch to DSP 1 and receive at 100 Msps, set the environment variable UHD_SWAP_RX_DSPS 
+to 1 before creating the USRP object and set_rx_rate to 25 Msps. To receive at 25 Msps or
+lower, set UHD_SWAP_RX_DSPS to 0 (or remove it from the environment) and set_rx_rate to
+the desired rate.
+
+When receiving at 100 Msps, a maximum of 2^18 (262,144) contiguous samples (the size of the
+N210's SRAM) can be requested at a time. Only STREAM_MODE_NUM_SAMPS_AND_DONE is supported. 
+
+See uhd_streamer.cpp for an example.
+
+Load the FPGA
+-------------
+
+cd path/to/N210CeVI
+
+# Substitute the IP address of your N210
+/usr/local/share/uhd/utils/usrp_n2xx_net_burner.py --addr=192.168.10.2 --fpga=n210_r3.bin
+
+# If that went okay, power cycle the N210 or:
+/usr/local/share/uhd/utils/usrp_n2xx_net_burner.py --addr=192.168.10.2 --reset
+
+Add support to UHD
+------------------
+
+# First, build and instal UHD from source as usual.
+# Then, replace usrp2_impl.cpp
+
+cp path/to/N210CeVI/usrp2_impl.cpp path/to/uhd/host/lib/usrp/usrp2/
+
+# Build and install UHD again
+
+Build the sample app
+--------------------
+cd path/to/N210CeVI
+
+gcc uhd_streamer.cpp -o uhd_streamer -luhd
+
+./uhd_streamer --help
+
