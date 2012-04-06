@@ -1,5 +1,5 @@
 //
-// Copyright 2011 Ettus Research LLC
+// Copyright 2011-2012 Ettus Research LLC
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -56,24 +56,24 @@ module u1e_core
    localparam SR_TX_FRONT = 54;      // 5 regs (+0 to +4)
 
    localparam SR_REG_TEST32 = 60;    // 1 reg
-   localparam SR_CLEAR_RX_FIFO = 61; // 1 reg
-   localparam SR_CLEAR_TX_FIFO = 62; // 1 reg
+   localparam SR_CLEAR_FIFO = 61;    // 1 reg
    localparam SR_GLOBAL_RESET = 63;  // 1 reg
+   localparam SR_USER_REGS = 64;     // 2 regs
 
-   wire [7:0]	COMPAT_NUM = 8'd6;
+   localparam SR_GPIO = 128;         // 5 regs
    
    wire 	wb_clk = clk_fpga;
    wire 	wb_rst, global_reset;
 
    wire 	pps_int;
    wire [63:0] 	vita_time, vita_time_pps;
-   reg [15:0] 	reg_leds, reg_cgen_ctrl, reg_test, xfer_rate;
+   reg [15:0] 	reg_cgen_ctrl, reg_test, xfer_rate;
    wire [7:0] 	test_rate;
    wire [3:0] 	test_ctrl;
-   
-   wire [7:0] 	set_addr;
-   wire [31:0] 	set_data;
-   wire 	set_stb;
+
+   wire [7:0]  set_addr, set_addr_user;
+   wire [31:0] set_data, set_data_user;
+   wire        set_stb, set_stb_user;
 
    wire [31:0] 	debug_vt;
    wire 	rx_overrun_dsp0, rx_overrun_dsp1, rx_overrun_gpmc, tx_underrun_dsp, tx_underrun_gpmc;
@@ -103,15 +103,13 @@ module u1e_core
    wire 	 tx_src_rdy, tx_dst_rdy, rx_src_rdy, rx_dst_rdy, 
 		 tx_err_src_rdy, tx_err_dst_rdy;
 
-   wire 	 clear_tx, clear_rx;
-   
-   setting_reg #(.my_addr(SR_CLEAR_RX_FIFO), .width(1)) sr_clear_rx
-     (.clk(wb_clk),.rst(wb_rst),.strobe(set_stb),.addr(set_addr),
-      .in(set_data),.out(),.changed(clear_rx));
+   wire 	 clear_fifo;
 
-   setting_reg #(.my_addr(SR_CLEAR_TX_FIFO), .width(1)) sr_clear_tx
+   setting_reg #(.my_addr(SR_CLEAR_FIFO), .width(1)) sr_clear_fifo
      (.clk(wb_clk),.rst(wb_rst),.strobe(set_stb),.addr(set_addr),
-      .in(set_data),.out(),.changed(clear_tx));
+      .in(set_data),.out(),.changed(clear_fifo));
+
+   wire 	 run_rx0, run_rx1;
 
    gpmc #(.TXFIFOSIZE(TXFIFOSIZE), .RXFIFOSIZE(RXFIFOSIZE))
    gpmc (.arst(wb_rst),
@@ -126,7 +124,7 @@ module u1e_core
 	 .wb_sel_o(m0_sel), .wb_cyc_o(m0_cyc), .wb_stb_o(m0_stb), .wb_we_o(m0_we),
 	 .wb_ack_i(m0_ack),
 	 
-	 .fifo_clk(wb_clk), .fifo_rst(wb_rst), .clear_tx(clear_tx), .clear_rx(clear_rx),
+	 .fifo_clk(wb_clk), .fifo_rst(wb_rst), .clear_tx(clear_fifo), .clear_rx(clear_fifo),
 	 .tx_data_o(tx_data), .tx_src_rdy_o(tx_src_rdy), .tx_dst_rdy_i(tx_dst_rdy),
 	 .rx_data_i(rx_data), .rx_src_rdy_i(rx_src_rdy), .rx_dst_rdy_o(rx_dst_rdy),
 
@@ -142,36 +140,37 @@ module u1e_core
    // /////////////////////////////////////////////////////////////////////////
    // RX ADC Frontend, does IQ Balance, DC Offset, muxing
 
-   wire [23:0] 	 adc_i, adc_q;  // 24 bits is total overkill here, but it matches u2/u2p
-   wire 	 run_rx0, run_rx1;
-   
+   wire [23:0] 	 rx_fe_i, rx_fe_q;  // 24 bits is total overkill here, but it matches u2/u2p
+
    rx_frontend #(.BASE(SR_RX_FRONT)) rx_frontend
      (.clk(wb_clk),.rst(wb_rst),
       .set_stb(set_stb),.set_addr(set_addr),.set_data(set_data),
       .adc_a({rx_i,4'b00}),.adc_ovf_a(0),
       .adc_b({rx_q,4'b00}),.adc_ovf_b(0),
-      .i_out(adc_i), .q_out(adc_q), .run(run_rx0 | run_rx1), .debug());
+      .i_out(rx_fe_i), .q_out(rx_fe_q), .run(run_rx0 | run_rx1), .debug());
    
    // /////////////////////////////////////////////////////////////////////////
    // DSP RX 0
 
    wire [31:0] 	 sample_rx0;
-   wire 	 strobe_rx0;
+   wire 	 strobe_rx0, clear_rx0;
    wire [35:0] 	 vita_rx_data0;
    wire 	 vita_rx_src_rdy0, vita_rx_dst_rdy0;
    
-   dsp_core_rx #(.BASE(SR_RX_DSP0)) dsp_core_rx0
-     (.clk(wb_clk),.rst(wb_rst),
+   ddc_chain #(.BASE(SR_RX_DSP0), .DSPNO(0)) ddc_chain0
+     (.clk(wb_clk), .rst(wb_rst), .clr(clear_rx0),
       .set_stb(set_stb),.set_addr(set_addr),.set_data(set_data),
-      .adc_i(adc_i),.adc_ovf_i(0),.adc_q(adc_q),.adc_ovf_q(0),
+      .set_stb_user(set_stb_user), .set_addr_user(set_addr_user), .set_data_user(set_data_user),
+      .rx_fe_i(rx_fe_i),.rx_fe_q(rx_fe_q),
       .sample(sample_rx0), .run(run_rx0), .strobe(strobe_rx0),
       .debug() );
 
-   vita_rx_chain #(.BASE(SR_RX_CTRL0), .UNIT(0), .FIFOSIZE(9), .PROT_ENG_FLAGS(0)) vita_rx_chain0
-     (.clk(wb_clk),.reset(wb_rst),.clear(clear_rx),
+   vita_rx_chain #(.BASE(SR_RX_CTRL0), .UNIT(0), .FIFOSIZE(10), .PROT_ENG_FLAGS(0), .DSP_NUMBER(0)) vita_rx_chain0
+     (.clk(wb_clk),.reset(wb_rst),
       .set_stb(set_stb),.set_addr(set_addr),.set_data(set_data),
+      .set_stb_user(set_stb_user), .set_addr_user(set_addr_user), .set_data_user(set_data_user),
       .vita_time(vita_time), .overrun(rx_overrun_dsp0),
-      .sample(sample_rx0), .run(run_rx0), .strobe(strobe_rx0),
+      .sample(sample_rx0), .run(run_rx0), .strobe(strobe_rx0), .clear_o(clear_rx0),
       .rx_data_o(vita_rx_data0), .rx_dst_rdy_i(vita_rx_dst_rdy0), .rx_src_rdy_o(vita_rx_src_rdy0),
       .debug() );
    
@@ -179,22 +178,24 @@ module u1e_core
    // DSP RX 1
 
    wire [31:0] 	 sample_rx1;
-   wire 	 strobe_rx1;
+   wire 	 strobe_rx1, clear_rx1;
    wire [35:0] 	 vita_rx_data1;
    wire 	 vita_rx_src_rdy1, vita_rx_dst_rdy1;
    
-   dsp_core_rx #(.BASE(SR_RX_DSP1)) dsp_core_rx1
-     (.clk(wb_clk),.rst(wb_rst),
+   ddc_chain #(.BASE(SR_RX_DSP1), .DSPNO(1)) ddc_chain1
+     (.clk(wb_clk),.rst(wb_rst), .clr(clear_rx1),
       .set_stb(set_stb),.set_addr(set_addr),.set_data(set_data),
-      .adc_i(adc_i),.adc_ovf_i(0),.adc_q(adc_q),.adc_ovf_q(0),
+      .set_stb_user(set_stb_user), .set_addr_user(set_addr_user), .set_data_user(set_data_user),
+      .rx_fe_i(rx_fe_i),.rx_fe_q(rx_fe_q),
       .sample(sample_rx1), .run(run_rx1), .strobe(strobe_rx1),
       .debug() );
 
-   vita_rx_chain #(.BASE(SR_RX_CTRL1), .UNIT(1), .FIFOSIZE(9), .PROT_ENG_FLAGS(0)) vita_rx_chain1
-     (.clk(wb_clk),.reset(wb_rst),.clear(clear_rx),
+   vita_rx_chain #(.BASE(SR_RX_CTRL1), .UNIT(1), .FIFOSIZE(10), .PROT_ENG_FLAGS(0), .DSP_NUMBER(1)) vita_rx_chain1
+     (.clk(wb_clk),.reset(wb_rst),
       .set_stb(set_stb),.set_addr(set_addr),.set_data(set_data),
+      .set_stb_user(set_stb_user), .set_addr_user(set_addr_user), .set_data_user(set_data_user),
       .vita_time(vita_time), .overrun(rx_overrun_dsp1),
-      .sample(sample_rx1), .run(run_rx1), .strobe(strobe_rx1),
+      .sample(sample_rx1), .run(run_rx1), .strobe(strobe_rx1), .clear_o(clear_rx1),
       .rx_data_o(vita_rx_data1), .rx_dst_rdy_i(vita_rx_dst_rdy1), .rx_src_rdy_o(vita_rx_src_rdy1),
       .debug() );
 
@@ -202,7 +203,7 @@ module u1e_core
    // RX Stream muxing
 
    fifo36_mux #(.prio(0)) mux_data_streams
-     (.clk(wb_clk), .reset(wb_rst), .clear(0),
+     (.clk(wb_clk), .reset(wb_rst), .clear(clear_fifo),
       .data0_i(vita_rx_data0), .src0_rdy_i(vita_rx_src_rdy0), .dst0_rdy_o(vita_rx_dst_rdy0),
       .data1_i(vita_rx_data1), .src1_rdy_i(vita_rx_src_rdy1), .dst1_rdy_o(vita_rx_dst_rdy1),
       .data_o(rx_data), .src_rdy_o(rx_src_rdy), .dst_rdy_i(rx_dst_rdy));
@@ -210,27 +211,38 @@ module u1e_core
    // ///////////////////////////////////////////////////////////////////////////////////
    // DSP TX
 
-   wire [23:0] 	 tx_i_int, tx_q_int;
    wire 	 run_tx;
-   
-   vita_tx_chain #(.BASE_CTRL(SR_TX_CTRL), .BASE_DSP(SR_TX_DSP), 
+   wire [23:0] 	 tx_fe_i, tx_fe_q;
+   wire [31:0]   sample_tx;
+   wire strobe_tx, clear_tx;
+
+   vita_tx_chain #(.BASE(SR_TX_CTRL), .FIFOSIZE(10), .POST_ENGINE_FIFOSIZE(11),
 		   .REPORT_ERROR(1), .DO_FLOW_CONTROL(0),
 		   .PROT_ENG_FLAGS(0), .USE_TRANS_HEADER(0),
 		   .DSP_NUMBER(0)) 
    vita_tx_chain
      (.clk(wb_clk), .reset(wb_rst),
       .set_stb(set_stb),.set_addr(set_addr),.set_data(set_data),
+      .set_stb_user(set_stb_user), .set_addr_user(set_addr_user), .set_data_user(set_data_user),
       .vita_time(vita_time),
       .tx_data_i(tx_data), .tx_src_rdy_i(tx_src_rdy), .tx_dst_rdy_o(tx_dst_rdy),
       .err_data_o(tx_err_data), .err_src_rdy_o(tx_err_src_rdy), .err_dst_rdy_i(tx_err_dst_rdy),
-      .tx_i(tx_i_int),.tx_q(tx_q_int),
-      .underrun(tx_underrun_dsp), .run(run_tx),
+      .sample(sample_tx), .strobe(strobe_tx),
+      .underrun(tx_underrun_dsp), .run(run_tx), .clear_o(clear_tx),
       .debug(debug_vt));
+
+   duc_chain #(.BASE(SR_TX_DSP), .DSPNO(0)) duc_chain
+     (.clk(wb_clk), .rst(wb_rst), .clr(clear_tx),
+      .set_stb(set_stb),.set_addr(set_addr),.set_data(set_data),
+      .set_stb_user(set_stb_user), .set_addr_user(set_addr_user), .set_data_user(set_data_user),
+      .tx_fe_i(tx_fe_i),.tx_fe_q(tx_fe_q),
+      .sample(sample_tx), .run(run_tx), .strobe(strobe_tx),
+      .debug() );
 
    tx_frontend #(.BASE(SR_TX_FRONT), .WIDTH_OUT(14)) tx_frontend
      (.clk(wb_clk), .rst(wb_rst),
       .set_stb(set_stb),.set_addr(set_addr),.set_data(set_data),
-      .tx_i(tx_i_int), .tx_q(tx_q_int), .run(1'b1),
+      .tx_i(tx_fe_i), .tx_q(tx_fe_q), .run(1'b1),
       .dac_a(tx_i), .dac_b(tx_q));
 
    // /////////////////////////////////////////////////////////////////////////////////////
@@ -253,14 +265,20 @@ module u1e_core
    wire 	 s8_we,s9_we,sa_we,sb_we,sc_we,sd_we, se_we, sf_we;
    
    wb_1master #(.dw(dw), .aw(aw), .sw(sw), .decode_w(4),
-		.s0_addr(4'h0), .s0_mask(4'hF), .s1_addr(4'h1), .s1_mask(4'hF),
-		.s2_addr(4'h2), .s2_mask(4'hF),	.s3_addr(4'h3), .s3_mask(4'hF),
-		.s4_addr(4'h4), .s4_mask(4'hF),	.s5_addr(4'h5), .s5_mask(4'hF),
-		.s6_addr(4'h6), .s6_mask(4'hF),	.s7_addr(4'h7), .s7_mask(4'hF),
-		.s8_addr(4'h8), .s8_mask(4'hE),	.s9_addr(4'hf), .s9_mask(4'hF), // slave 8 is double wide
-		.sa_addr(4'ha), .sa_mask(4'hF),	.sb_addr(4'hb), .sb_mask(4'hF),
-		.sc_addr(4'hc), .sc_mask(4'hF),	.sd_addr(4'hd), .sd_mask(4'hF),
-		.se_addr(4'he), .se_mask(4'hF),	.sf_addr(4'hf), .sf_mask(4'hF))
+		.s0_addr(4'h0), .s0_mask(4'hF), // Misc Regs
+		.s1_addr(4'h1), .s1_mask(4'hF), // Unused
+		.s2_addr(4'h2), .s2_mask(4'hF),	// SPI
+		.s3_addr(4'h3), .s3_mask(4'hF), // I2C
+		.s4_addr(4'h4), .s4_mask(4'hF),	// Unused
+		.s5_addr(4'h5), .s5_mask(4'hF), // Unused on B1x0, Async Msg on E1x0
+		.s6_addr(4'h6), .s6_mask(4'hF),	// Unused
+		.s7_addr(4'h7), .s7_mask(4'hF), // Readback MUX
+		.s8_addr(4'h8), .s8_mask(4'h8), // Setting Regs -- slave 8 is 8 slaves wide
+		// slaves 9-f alias to slave 1, all are unused
+		.s9_addr(4'h1), .s9_mask(4'hF),
+		.sa_addr(4'h1), .sa_mask(4'hF),	.sb_addr(4'h1), .sb_mask(4'hF),
+		.sc_addr(4'h1), .sc_mask(4'hF),	.sd_addr(4'h1), .sd_mask(4'hF),
+		.se_addr(4'h1), .se_mask(4'hF),	.sf_addr(4'h1), .sf_mask(4'hF))
    wb_1master
      (.clk_i(wb_clk),.rst_i(wb_rst),       
       .m0_dat_o(m0_dat_miso),.m0_ack_o(m0_ack),.m0_err_o(m0_err),.m0_rty_o(m0_rty),.m0_dat_i(m0_dat_mosi),
@@ -298,23 +316,21 @@ module u1e_core
       .sf_dat_o(sf_dat_mosi),.sf_adr_o(sf_adr),.sf_sel_o(sf_sel),.sf_we_o(sf_we),.sf_cyc_o(sf_cyc),.sf_stb_o(sf_stb),
       .sf_dat_i(sf_dat_miso),.sf_ack_i(sf_ack),.sf_err_i(0),.sf_rty_i(0) );
 
+   assign s1_ack = 0;   assign s4_ack = 0;   assign s6_ack = 0;
    assign s9_ack = 0;   assign sa_ack = 0;   assign sb_ack = 0;
    assign sc_ack = 0;   assign sd_ack = 0;   assign se_ack = 0;   assign sf_ack = 0;
 
    // /////////////////////////////////////////////////////////////////////////////////////
    // Slave 0, Misc LEDs, Switches, controls
    
-   localparam REG_LEDS = 7'd0;         // out
    localparam REG_CGEN_CTRL = 7'd4;    // out
    localparam REG_CGEN_ST = 7'd6;      // in
    localparam REG_TEST = 7'd8;         // out
    localparam REG_XFER_RATE = 7'd14;   // out
-   localparam REG_COMPAT = 7'd16;      // in
    
    always @(posedge wb_clk)
      if(wb_rst)
        begin
-	  reg_leds <= 0;
 	  reg_cgen_ctrl <= 2'b11;
 	  reg_test <= 0;
 	  xfer_rate <= 0;
@@ -322,8 +338,6 @@ module u1e_core
      else
        if(s0_cyc & s0_stb & s0_we) 
 	 case(s0_adr[6:0])
-	   REG_LEDS :
-	     reg_leds <= s0_dat_mosi;
 	   REG_CGEN_CTRL :
 	     reg_cgen_ctrl <= s0_dat_mosi;
 	   REG_TEST :
@@ -335,28 +349,15 @@ module u1e_core
    assign test_ctrl = xfer_rate[11:8];
    assign test_rate = xfer_rate[7:0];
    
-   assign { debug_led[3:0] } = ~{run_rx0 | run_rx1,run_tx,reg_leds[1:0]};
+   assign { debug_led[3:0] } = ~{1'b1, run_tx, run_rx0 | run_rx1, cgen_st_ld};
    assign { cgen_sync_b, cgen_ref_sel } = reg_cgen_ctrl;
    
-   assign s0_dat_miso = (s0_adr[6:0] == REG_LEDS) ? reg_leds : 
-			(s0_adr[6:0] == REG_CGEN_CTRL) ? reg_cgen_ctrl :
+   assign s0_dat_miso = (s0_adr[6:0] == REG_CGEN_CTRL) ? reg_cgen_ctrl :
 			(s0_adr[6:0] == REG_CGEN_ST) ? {13'b0,cgen_st_status,cgen_st_ld,cgen_st_refmon} :
 			(s0_adr[6:0] == REG_TEST) ? reg_test :
-			(s0_adr[6:0] == REG_COMPAT) ? { 8'd0, COMPAT_NUM } :
 			16'hBEEF;
    
    assign s0_ack = s0_stb & s0_cyc;
-
-   // /////////////////////////////////////////////////////////////////////////////////////
-   // Slave 1, UART
-   //    depth of 3 is 128 entries, clkdiv of 278 gives 230.4k with a 64 MHz system clock
-   
-   simple_uart #(.TXDEPTH(3),.RXDEPTH(3), .CLKDIV_DEFAULT(278)) uart 
-     (.clk_i(wb_clk),.rst_i(wb_rst),
-      .we_i(s1_we),.stb_i(s1_stb),.cyc_i(s1_cyc),.ack_o(s1_ack),
-      .adr_i(s1_adr[3:1]),.dat_i({16'd0,s1_dat_mosi}),.dat_o(s1_dat_miso),
-      .rx_int_o(),.tx_int_o(),
-      .tx_o(debug_txd),.rx_i(debug_rxd),.baud_o());
 
    // /////////////////////////////////////////////////////////////////////////////////////
    // Slave 2, SPI
@@ -386,17 +387,15 @@ module u1e_core
    IOBUF sda_pin(.O(sda_pad_i), .IO(db_sda), .I(sda_pad_o), .T(sda_pad_oen_o));
 
    // /////////////////////////////////////////////////////////////////////////
-   // GPIOs -- Slave #4
+   // GPIOs
 
-   wire [31:0] 	atr_lines;
-   wire [31:0] 	debug_gpio_0, debug_gpio_1;
+   wire [31:0] gpio_readback;
    
-   nsgpio16LE 
-     nsgpio16LE(.clk_i(wb_clk),.rst_i(wb_rst),
-		.cyc_i(s4_cyc),.stb_i(s4_stb),.adr_i(s4_adr[3:0]),.we_i(s4_we),
-		.dat_i(s4_dat_mosi),.dat_o(s4_dat_miso),.ack_o(s4_ack),
-		.atr(atr_lines),.debug_0(debug_gpio_0),.debug_1(debug_gpio_1),
-		.gpio( {io_tx,io_rx} ) );
+   gpio_atr #(.BASE(SR_GPIO), .WIDTH(32)) 
+   gpio_atr(.clk(wb_clk),.reset(wb_rst),
+	    .set_stb(set_stb),.set_addr(set_addr),.set_data(set_data),
+	    .rx(run_rx0 | run_rx1), .tx(run_tx),
+	    .gpio({io_tx,io_rx}), .gpio_readback(gpio_readback) );
 
    ////////////////////////////////////////////////////////////////////////////
    // FIFO to WB slave for async messages - Slave #5
@@ -440,22 +439,22 @@ module u1e_core
    // Settings Bus -- Slave #8 + 9
 
    // only have 64 regs, 32 bits each with current setup...
-   settings_bus_16LE #(.AWIDTH(11),.RWIDTH(6)) settings_bus_16LE
+   settings_bus_16LE #(.AWIDTH(11),.RWIDTH(8)) settings_bus_16LE
      (.wb_clk(wb_clk),.wb_rst(wb_rst),.wb_adr_i(s8_adr),.wb_dat_i(s8_dat_mosi),
       .wb_stb_i(s8_stb),.wb_we_i(s8_we),.wb_ack_o(s8_ack),
       .strobe(set_stb),.addr(set_addr),.data(set_data) );
 
-   // /////////////////////////////////////////////////////////////////////////
-   // ATR Controller -- Slave #6
-
-   atr_controller16 atr_controller16
-     (.clk_i(wb_clk), .rst_i(wb_rst),
-      .adr_i(s6_adr[5:0]), .sel_i(s6_sel), .dat_i(s6_dat_mosi), .dat_o(s6_dat_miso),
-      .we_i(s6_we), .stb_i(s6_stb), .cyc_i(s6_cyc), .ack_o(s6_ack),
-      .run_rx(run_rx0 | run_rx1), .run_tx(run_tx), .ctrl_lines(atr_lines));
+   user_settings #(.BASE(SR_USER_REGS)) user_settings
+     (.clk(wb_clk),.rst(wb_rst),.set_stb(set_stb),
+      .set_addr(set_addr),.set_data(set_data),
+      .set_addr_user(set_addr_user),.set_data_user(set_data_user),
+      .set_stb_user(set_stb_user) );
 
    // /////////////////////////////////////////////////////////////////////////
    // Readback mux 32 -- Slave #7
+
+   //compatibility number -> increment when the fpga has been sufficiently altered
+   localparam compat_num = {16'd9, 16'd0}; //major, minor
 
    wire [31:0] reg_test32;
 
@@ -471,7 +470,7 @@ module u1e_core
       .word00(vita_time[63:32]),        .word01(vita_time[31:0]),
       .word02(vita_time_pps[63:32]),    .word03(vita_time_pps[31:0]),
       .word04(reg_test32),              .word05(err_status),
-      .word06(32'b0),                   .word07(32'b0),
+      .word06(compat_num),              .word07(gpio_readback),
       .word08(32'b0),                   .word09(32'b0),
       .word10(32'b0),                   .word11(32'b0),
       .word12(32'b0),                   .word13(32'b0),
@@ -481,7 +480,7 @@ module u1e_core
    // /////////////////////////////////////////////////////////////////////////
    // VITA Timing
 
-   time_64bit #(.TICKS_PER_SEC(32'd64000000),.BASE(SR_TIME64)) time_64bit
+   time_64bit #(.BASE(SR_TIME64)) time_64bit
      (.clk(wb_clk), .rst(wb_rst), .set_stb(set_stb), .set_addr(set_addr), .set_data(set_data),
       .pps(pps_in), .vita_time(vita_time), .vita_time_pps(vita_time_pps), .pps_int(pps_int),
       .exp_time_in(0));
@@ -489,26 +488,7 @@ module u1e_core
    // /////////////////////////////////////////////////////////////////////////////////////
    // Debug circuitry
 
-   assign debug_clk = { EM_CLK, clk_fpga };
-
-/*
-   assign debug = { { rx_have_data, tx_have_space, EM_NCS6, EM_NCS5, EM_NCS4, EM_NWE, EM_NOE, rx_overrun },
-		    { tx_src_rdy, tx_src_rdy_int, tx_dst_rdy, tx_dst_rdy_int, rx_src_rdy, rx_src_rdy_int, rx_dst_rdy, rx_dst_rdy_int },
-		    { EM_D } };
-
-*/
-   assign debug = debug_gpmc;
-
-   assign debug_gpio_0 = { {run_tx, 2'b0, strobe_rx0, tx_i[11:0]}, 
-			   {2'b00, tx_src_rdy, tx_dst_rdy, tx_q[11:0]} };
-
-   assign debug_gpio_1 = debug_vt;
+   assign debug_clk = 2'b00; //{ EM_CLK, clk_fpga };
+   assign debug = 0;
    
-/*   
-   assign debug_gpio_1 = { {rx_enable, rx_src_rdy, rx_dst_rdy, rx_src_rdy & ~rx_dst_rdy},
-			   {tx_enable, tx_src_rdy, tx_dst_rdy, tx_dst_rdy & ~tx_src_rdy},
-			   {2'b0, rx_src_rdy, rx_dst_rdy, rx_data[33:32],2'b0},
-			   {2'b0, bus_error, debug_gpmc[4:0] },
-			   {misc_gpio[7:0]} };
-  */ 
 endmodule // u1e_core

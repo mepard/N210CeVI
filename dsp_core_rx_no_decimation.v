@@ -1,6 +1,6 @@
 //
-// Copyright 2011 Horizon Analog, Inc.
-// Base upon works Copyright 2011 Ettus Research LLC
+// Copyright 2011-2012 Horizon Analog, Inc.
+// Base upon works Copyright 2011-2012 Ettus Research LLC
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -21,8 +21,8 @@ module dsp_core_rx_no_decimation
   (input clk, input rst,
    input set_stb, input [7:0] set_addr, input [31:0] set_data,
 
-   input [23:0] adc_i, input adc_ovf_i,
-   input [23:0] adc_q, input adc_ovf_q,
+   input [23:0] rx_fe_i,
+   input [23:0] rx_fe_q,
    
    output [31:0] sample,
    output [31:0] debug
@@ -63,13 +63,13 @@ module dsp_core_rx_no_decimation
    always @(posedge clk)
      if(swap_iq)
        begin
-	  adc_i_mux <= adc_q;
-	  adc_q_mux <= realmode ? 24'd0 : adc_i;
+	  adc_i_mux <= rx_fe_q;
+	  adc_q_mux <= realmode ? 24'd0 : rx_fe_i;
        end
      else
        begin
-	  adc_i_mux <= adc_i;
-	  adc_q_mux <= realmode ? 24'd0 : adc_q;
+	  adc_i_mux <= rx_fe_i;
+	  adc_q_mux <= realmode ? 24'd0 : rx_fe_q;
        end
 
    // NCO
@@ -85,8 +85,10 @@ module dsp_core_rx_no_decimation
 	    .xi({adc_i_mux[23],adc_i_mux}),. yi({adc_q_mux[23],adc_q_mux}), .zi(phase[31:8]),
 	    .xo(i_cordic),.yo(q_cordic),.zo() );
 
-   clip_reg #(.bits_in(25), .bits_out(24)) clip_i (.clk(clk), .in(i_cordic), .out(i_cordic_clip));
-   clip_reg #(.bits_in(25), .bits_out(24)) clip_q (.clk(clk), .in(q_cordic), .out(q_cordic_clip));
+   clip_reg #(.bits_in(25), .bits_out(24)) clip_i
+     (.clk(clk), .in(i_cordic), .strobe_in(1'b1), .out(i_cordic_clip));
+   clip_reg #(.bits_in(25), .bits_out(24)) clip_q
+     (.clk(clk), .in(q_cordic), .strobe_in(1'b1), .out(q_cordic_clip));
 
    // No decimation or half-band filters
    

@@ -1,59 +1,65 @@
 100 Msps Receive Support for USRP N210
 ======================================
 
-To receive at 100 Msps, you'll need to load a modified FPGA image onto the N210 and
-use a UHD library that has been modified.
+To receive at 100 Msps, you'll need to load a modified FPGA image onto the N210 and use
+UHD 003.004.000-ish library that works with FPGA compatibility version 9.0. The changes 
+are based on uhd/fpga/usrp2 pulled on 6-Apr-2012. No changes to uhd/host are required.
 
-The pre-build FPGA image was configured for N210 revisions 2 or 3. The ISE project and 
-top module require modification for other revisions.
-
-It is based on UHD-images-003.002.003, compatibility version 7.3.
+There are pre-built images and ISE projects for N210 revisions 3 and 4. The rev 3
+image will also work on rev 2 boards.
 
 The FPGA has no transmit logic, so it can only receive. We've tested it with a DBSRX2,
 but other daughterboards should work.
 
 In the modified FPGA, DSP 0 is unchanged and can be used for normal decimation to 25 Msps
-or below. DSP 1 only supports 100 Msps.
+or below. DSP 1 only supports 100 Msps. 
 
-Normally, UHD only uses DSP 1 for multi-channel receives. The modified usrp2_impl.cpp 
-uses the environment variable UHD_SWAP_RX_DSPS to get access to DSP 1.
+To receive at 100 Msps, setup two channels:
 
-To switch to DSP 1 and receive at 100 Msps, set the environment variable UHD_SWAP_RX_DSPS 
-to 1 before creating the USRP object and set_rx_rate to 25 Msps. To receive at 25 Msps or
-lower, set UHD_SWAP_RX_DSPS to 0 (or remove it from the environment) and set_rx_rate to
-the desired rate.
+	usrp->set_rx_subdev_spec(uhd::usrp::subdev_spec_t("A:0 A:0"));
 
+And specify channel 1 for set_rx_freq, get_rx_gain, etc.
+
+When creating the rx_streamer, specify channel 1:
+
+	stream_args.channels.push_back(1);
+	uhd::rx_streamer::sptr rx_stream = usrp->get_rx_stream(stream_args);
+	
 When receiving at 100 Msps, a maximum of 2^18 (262,144) contiguous samples (the size of the
 N210's SRAM) can be requested at a time. Only STREAM_MODE_NUM_SAMPS_AND_DONE is supported. 
 
-See uhd_streamer.cpp for an example.
+To receive at normal decimated rates, just use channel 0 or don't specify a channel.
+
+The uhd_streamer.cpp command line app has details. We've built and used it on Ubuntu 10.04
+and Windows 7 Pro. It also has a client/server facility to make a set of USRPs sharable
+with several apps.
 
 Load the FPGA
 -------------
-
 cd path/to/N210CeVI
 
 # Substitute the IP address of your N210
 /usr/local/share/uhd/utils/usrp_n2xx_net_burner.py --addr=192.168.10.2 --fpga=n210_r3.bin
+or
+/usr/local/share/uhd/utils/usrp_n2xx_net_burner.py --addr=192.168.10.2 --fpga=n210_r4.bin
 
 # If that went okay, power cycle the N210 or:
 /usr/local/share/uhd/utils/usrp_n2xx_net_burner.py --addr=192.168.10.2 --reset
 
-Add support to UHD
-------------------
+Use similar commands on Windows.
 
-# First, build and instal UHD from source as usual.
-# Then, replace usrp2_impl.cpp
-
-cp path/to/N210CeVI/usrp2_impl.cpp path/to/uhd/host/lib/usrp/usrp2/
-
-# Build and install UHD again
-
-Build the sample app
---------------------
+Build uhd_streamer on Linux
+---------------------------
 cd path/to/N210CeVI
 
 gcc uhd_streamer.cpp -o uhd_streamer -luhd
 
 ./uhd_streamer --help
 
+Build uhd_streamer on Windows
+-----------------------------
+(I really need to create the cmake goo for this.)
+
+I manually created a Visual Studio 10 project for a console app. I deleted the generated
+.cpp file and added uhd_streamer.cpp. Then I added include directories for UHD and boost,
+library directories for UHD and boost, and the UHD lib as a link input.

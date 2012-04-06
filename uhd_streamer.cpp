@@ -1,5 +1,5 @@
 //
-// Copyright 2011 Horizon Analog, Inc.
+// Copyright 2011-2012 Horizon Analog, Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -19,19 +19,30 @@
 #include <config.h>
 #endif
 
+#define _CRT_SECURE_NO_DEPRECATE		// Microsoft's xxx_s functions aren't portable. Shut off warnings.
+
 #include <stdlib.h>
 
 #include <uhd/utils/thread_priority.hpp>
 #include <uhd/utils/safe_main.hpp>
-#include <uhd/usrp/single_usrp.hpp>
+#include <uhd/usrp/multi_usrp.hpp>
+#include <uhd/version.hpp>
+#include <uhd/device.hpp>
+#include <uhd/types/ranges.hpp>
+#include <uhd/property_tree.hpp>
+#include <uhd/usrp/dboard_id.hpp>
+#include <uhd/usrp/mboard_eeprom.hpp>
+#include <uhd/usrp/dboard_eeprom.hpp>
 
+#include <boost/algorithm/string.hpp> //for split
 #include <boost/thread.hpp>
 #include <boost/math/special_functions/round.hpp>
 #include <boost/scoped_ptr.hpp>
 #include <boost/shared_ptr.hpp>
-#include <boost/interprocess/sync/file_lock.hpp>
 #include <boost/program_options.hpp>
 #include <boost/format.hpp>
+#include <boost/foreach.hpp>
+#include <boost/asio.hpp>
 
 #include <iostream>
 #include <fstream>
@@ -40,15 +51,215 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/time.h>
-#include <time.h>
 #include <cstdio>
 
 #include <stdexcept>
 #include <signal.h>
 #include <float.h>
 #include <errno.h>
-#include <arpa/inet.h>
+
+#define	CLIENT_SERVER	1
+
+namespace DeviceLister
+{
+	using namespace uhd;
+	
+	std::string prop_names_to_pp_string(const std::vector<std::string> &prop_names){
+		std::stringstream ss; size_t count = 0;
+		ss << "{";
+		BOOST_FOREACH(const std::string &prop_name, prop_names){
+			ss << ((count++)? ", " : "") << "'" << prop_name << "'";
+		}
+		ss << "}";
+		return ss.str();
+	}
+	
+	std::string path_name_and_value (property_tree::sptr tree, const fs_path &path)
+	{
+		std::stringstream ss;
+		ss <<  boost::format("'%s', '%s'") % path % (tree->access<std::string>(path).get());
+		return ss.str();
+	}
+	
+	std::string path_name_and_vector (property_tree::sptr tree, const fs_path &path)
+	{
+		std::stringstream ss;
+		ss << boost::format("'%s', %s") % path% prop_names_to_pp_string(tree->access<std::vector<std::string> >(path).get());
+		return ss.str();
+	}
+	
+	std::string path_name_and_list (property_tree::sptr tree, const fs_path &path)
+	{
+		std::stringstream ss;
+		ss << boost::format("'%s', %s") % path % prop_names_to_pp_string(tree->list(path));
+		return ss.str();
+	}
+	
+	std::string path_name_and_gains (property_tree::sptr tree, const fs_path &path)
+	{
+		std::stringstream ss;
+		std::vector<std::string> gain_names = tree->list(path / "gains");
+		ss << boost::format("'%s', {") % (path / "gains");
+		std::string		separator = "";
+		BOOST_FOREACH(const std::string &name, gain_names){
+			fs_path	gain_path = path / "gains" / name / "range";
+			meta_range_t gain_range = tree->access<meta_range_t>(gain_path).get();
+			ss << boost::format("%s{'%s', [%.1f %.1f %.1f]}") % separator % name % gain_range.start() % gain_range.step() % gain_range.stop();
+			separator = ", ";
+		}
+		ss << "}" << std::endl;
+		return ss.str();
+	}
+	
+	std::string path_name_and_frequency_range (property_tree::sptr tree, const fs_path &path)
+	{
+		std::stringstream ss;
+		fs_path	range_path = path / "range";
+		meta_range_t freq_range = tree->access<meta_range_t>(range_path).get();
+		ss << boost::format("'%s', [%g %g]") % range_path % freq_range.start() % freq_range.stop() << std::endl;
+		return ss.str();
+	}
+	
+	std::string get_dsp_pp_string(property_tree::sptr tree, const fs_path &path){
+		std::stringstream ss;
+		ss << path_name_and_frequency_range (tree, path / "freq");
+		return ss.str();
+	}
+	
+	std::string get_subdev_pp_string(const std::string &type, property_tree::sptr tree, const fs_path &path){
+		std::stringstream ss;
+	
+		ss << path_name_and_value(tree, (path / "name")) << std::endl;
+		ss << path_name_and_vector(tree, (path / "antenna/options")) << std::endl;
+		ss << path_name_and_list(tree, (path / "sensors")) << std::endl;
+		ss << path_name_and_frequency_range (tree, path / "freq");
+		ss << path_name_and_frequency_range (tree, path / "bandwidth");
+		ss << path_name_and_gains (tree, path);
+	
+		return ss.str();
+	}
+	
+	std::string get_codec_pp_string(property_tree::sptr tree, const fs_path &path){
+		std::stringstream ss;
+	
+		ss << path_name_and_value(tree, (path / "name")) << std::endl;
+		ss << path_name_and_gains (tree, path);
+
+		return ss.str();
+	}
+	
+	std::string get_dboard_pp_string(const std::string &prefix, property_tree::sptr tree, const fs_path &path){
+		std::stringstream ss;
+
+		usrp::dboard_eeprom_t db_eeprom = tree->access<usrp::dboard_eeprom_t>(path / (prefix + "_eeprom")).get();
+		if (db_eeprom.id != usrp::dboard_id_t::none()) {
+			ss << boost::format("'%s/id', '%s'") % (path / (prefix + "_eeprom")) % db_eeprom.id.to_pp_string() << std::endl;
+			
+			if (not db_eeprom.serial.empty()) 
+				ss << boost::format("'%s/serial', '%s'") % (path / (prefix + "_eeprom")) % db_eeprom.serial << std::endl;
+			else
+				ss << boost::format("'%s/serial', ''") % (path / (prefix + "_eeprom")) << std::endl;
+			
+			if (prefix == "tx"){
+				usrp::dboard_eeprom_t gdb_eeprom = tree->access<usrp::dboard_eeprom_t>(path / "gdb_eeprom").get();
+				if (gdb_eeprom.id != usrp::dboard_id_t::none()) ss << boost::format("'%s/id', '%s'") % (path / "gdb_eeprom") % gdb_eeprom.id.to_pp_string() << std::endl;
+				if (not gdb_eeprom.serial.empty()) ss << boost::format("'%s/serial', '%s'") % (path / "gdb_eeprom") % gdb_eeprom.serial << std::endl;
+			}
+			
+			BOOST_FOREACH(const std::string &name, tree->list(path / (prefix + "_frontends"))){
+				ss << get_subdev_pp_string(prefix, tree, path / (prefix + "_frontends") / name);
+			}
+			ss << get_codec_pp_string(tree, path.branch_path().branch_path() / (prefix + "_codecs") / path.leaf());
+		}
+		return ss.str();
+	}
+	
+	std::string get_mboard_pp_string(property_tree::sptr tree, const fs_path &path){
+		std::stringstream ss;
+		ss << path_name_and_value(tree, (path / "name")) << std::endl;
+
+		usrp::mboard_eeprom_t mb_eeprom = tree->access<usrp::mboard_eeprom_t>(path / "eeprom").get();
+		BOOST_FOREACH(const std::string &key, mb_eeprom.keys()){
+			if (not mb_eeprom[key].empty()) ss << boost::format("'%s/%s', '%s'") % path % key % mb_eeprom[key] << std::endl;
+		}
+		ss << path_name_and_vector(tree, (path / "time_source/options")) << std::endl;
+		ss << path_name_and_vector(tree, (path / "clock_source/options")) << std::endl;
+		ss << path_name_and_list(tree, (path / "sensors")) << std::endl;
+
+		BOOST_FOREACH(const std::string &name, tree->list(path / "rx_dsps")){
+			ss << get_dsp_pp_string(tree, path / "rx_dsps" / name);
+		}
+		BOOST_FOREACH(const std::string &name, tree->list(path / "dboards")){
+			ss << get_dboard_pp_string("rx", tree, path / "dboards" / name);
+		}
+		BOOST_FOREACH(const std::string &name, tree->list(path / "tx_dsps")){
+			ss << get_dsp_pp_string(tree, path / "tx_dsps" / name);
+		}
+		BOOST_FOREACH(const std::string &name, tree->list(path / "dboards")){
+			ss << get_dboard_pp_string("tx", tree, path / "dboards" / name);
+		}
+		return ss.str();
+	}
+	
+	
+	std::string get_device_pp_string(property_tree::sptr tree){
+		std::stringstream ss;
+		ss << "{    ..." << std::endl;
+		BOOST_FOREACH(const std::string &name, tree->list("/mboards")){
+			ss << get_mboard_pp_string(tree, "/mboards/" + name);
+		}
+		ss << "};    ..." << std::endl;
+		return ss.str();
+	}
+	
+	void print_tree(std::ostream &output, const uhd::fs_path &path, uhd::property_tree::sptr tree){
+		output << path << std::endl;
+		BOOST_FOREACH(const std::string &name, tree->list(path)){
+			print_tree(output, path / name, tree);
+		}
+	}
+	
+	int ListDevices (std::ostream &output, boost::program_options::variables_map vm)
+	{
+		uhd::device_addrs_t device_addrs = uhd::device::find(std::string(""));
+	
+		if (device_addrs.size() == 0)
+		{
+			std::cerr << "No UHD Devices Found" << std::endl;
+			return ~0;
+		}
+	
+		output << "{" << std::endl;
+		for (size_t i = 0; i < device_addrs.size(); i++)
+		{
+			output << "%{" << std::endl;	// In stand-alone mode device::make produces output. Make it a comment.
+			
+			device::sptr dev = device::make(device_addrs[i]);
+			property_tree::sptr tree = dev->get_tree();
+
+			output << "%}" << std::endl;
+
+			if (vm.count("list"))
+			{
+				output << get_device_pp_string(tree);
+			}
+			
+			if (vm.count("string"))
+			{
+				output << device_addrs[i].to_pp_string() << std::endl << std::endl;
+				output << tree->access<std::string>(vm["string"].as<std::string>()).get() << std::endl;
+			}
+		
+			if (vm.count("tree") != 0)
+			{
+				print_tree(output, "/", tree);
+			}
+		}
+		output << "}" << std::endl;
+		return 0;
+	}
+	
+} // namespace DeviceLister
 
 namespace
 {
@@ -70,18 +281,18 @@ namespace
 	};
 	
 	volatile bool gotSIGINT = false;
-	volatile bool gotSIGHUP = false;
 	
 	void sig_handler(int sig)
 	{
 		if (sig == SIGINT)
 			gotSIGINT = true;
-		else if (sig == SIGHUP)
-			gotSIGHUP = true;
 	}
 	
 	void install_sig_handler(int signum, void (*new_handler)(int))
 	{
+#ifdef _WIN32
+		signal(signum, new_handler);
+#else
 		struct sigaction new_action;
 		memset (&new_action, 0, sizeof (new_action));
 		
@@ -94,6 +305,7 @@ namespace
 			std::cerr << boost::format ("Error %s from sigaction (install new)") % strerror(errno) << std::endl;
 			throw std::runtime_error ("sigaction");
 		}
+#endif
 	}
 	
 	void EnableRealtimeScheduling ()
@@ -104,19 +316,21 @@ namespace
 	class TimeOfDay
 	{
 		public:
-			struct timeval _timeval;
+			boost::posix_time::ptime _ptime;
 		
 		public:
 			TimeOfDay ()
 			{
-				gettimeofday(&_timeval, NULL);
+				_ptime = boost::posix_time::microsec_clock::universal_time();
 			}
 	};
 	
 	double ElapsedTimeInSeconds (TimeOfDay startingTime, TimeOfDay endingTime = TimeOfDay())
 	{
-		return (double)(endingTime._timeval.tv_sec - startingTime._timeval.tv_sec) 
-			 + (double)(endingTime._timeval.tv_usec - startingTime._timeval.tv_usec)*1e-6;
+		boost::posix_time::time_period		period (startingTime._ptime, endingTime._ptime);
+		boost::posix_time::time_duration 	duration = period.length();
+		
+		return (double) duration.ticks() / (double) boost::posix_time::time_duration::ticks_per_second();
 	}
 
 	template <typename RangeType>
@@ -125,7 +339,7 @@ namespace
 		return (range.start() + range.stop())/2.0;		// @@@ mod range.step()
 	}
 
-	void printStat (std::ostream &output, const char *s, const char *name, size_t count)
+	void printStat (std::ostream &output, const char *s, const char *name, uint64_t count)
 	{
 		if (count > 0)
 			output << boost::format("%s: %u %s") % s % count % name << std::endl;
@@ -195,7 +409,7 @@ namespace
 	class EventMonitor
 	{
 	  private:
-	  	uhd::usrp::single_usrp::sptr	 	_usrp;
+	  	uhd::usrp::multi_usrp::sptr	 		_usrp;
 	  	uhd::device::sptr					_device;
 		boost::thread						_thread;
 		volatile bool						_stop;
@@ -208,7 +422,7 @@ namespace
 		EventCounts eventCounts () { return _eventCounts; }
 		const EventCounts eventCounts () const { return _eventCounts; }
 		
-	  	EventMonitor (uhd::usrp::single_usrp::sptr usrp)
+	  	EventMonitor (uhd::usrp::multi_usrp::sptr usrp)
 	  	: _usrp (usrp)
 		, _device(usrp->get_device())
 	  	, _thread()
@@ -294,11 +508,14 @@ namespace
 			typedef boost::shared_ptr<ManagedUsrp>	sptr;
 			
 			bool							_verbose;
-			uhd::usrp::single_usrp::sptr	usrp;
+			uhd::usrp::multi_usrp::sptr		usrp;
+			bool							_closeWhenUnused;
+			bool							inUseThisTime;
 			
 			std::string						_deviceArgs;
 			MonitoredValue<std::string>		clockSource;
 			bool							usingExternalClock;
+			
 			MonitoredValue<double>			txFrequency;
 			MonitoredValue<double>			txOffset;
 			MonitoredValue<double>			txGain;
@@ -307,6 +524,7 @@ namespace
 			MonitoredValue<std::string>		txAntenna;
 	  		EventMonitor::sptr				txMonitor;
 			
+			bool							rxNeedToSetSubdevices;
 			MonitoredValue<double>			rxFrequency;
 			MonitoredValue<double>			rxOffset;
 			MonitoredValue<double>			rxRefFrequency;
@@ -315,12 +533,14 @@ namespace
 			MonitoredValue<double>			rxSampleRate;
 			MonitoredValue<std::string>		rxAntenna;
 						
-			
-			ManagedUsrp (bool verbose, uhd::usrp::single_usrp::sptr theUsrp, std::string device)
+			ManagedUsrp (bool verbose, uhd::usrp::multi_usrp::sptr theUsrp, std::string device, bool closeWhenUnused)
 			 :	_verbose(verbose)
 			 ,	usrp (theUsrp)
 			 ,	_deviceArgs (device)
+			 ,	_closeWhenUnused(closeWhenUnused)
+			 ,	inUseThisTime(true)
 			 ,	usingExternalClock(false)
+			 ,	rxNeedToSetSubdevices(true)
 			{}
 			
 			void ConfigureClock ()
@@ -341,7 +561,7 @@ namespace
 				}
 			}
 			
-			bool ConfigureTx ()
+			bool ConfigureTx (bool requireLock)
 			{
 				if (!txMonitor)
 				{
@@ -360,10 +580,10 @@ namespace
 					
 					uhd::tune_result_t tuneResult = usrp->set_tx_freq(uhd::tune_request_t(txFrequency.value(), txOffset.value()));
 					
-					double actualFrequency = round(usrp->get_tx_freq());
-    				if (actualFrequency != round(txFrequency))
+					double actualFrequency = boost::math::round(usrp->get_tx_freq());
+    				if (actualFrequency != boost::math::round(txFrequency.value()))
     				{
-						std::cerr << boost::format ("\"%s\".txFrequency = %16.12e unsupported, replaced with %16.12e\n") % _deviceArgs % txFrequency % actualFrequency;
+						std::cerr << boost::format ("\"%s\".txFrequency = %16.12e unsupported, replaced with %16.12e\n") % _deviceArgs % txFrequency.value() % actualFrequency;
 						txFrequency = 0;
 						return false;
 					}
@@ -408,7 +628,7 @@ namespace
 					if (fabs(actualSampleRate - txSampleRate) > 1e-6)
 					{
 						std::cerr << boost::format ("\"%s\".txSampleRate = %26.14g unsupported, replaced with %26.14g, differs by %26.14g\n") 
-														% _deviceArgs % txSampleRate % actualSampleRate % (actualSampleRate - txSampleRate);
+														% _deviceArgs % txSampleRate.value() % actualSampleRate % (actualSampleRate - txSampleRate);
 						txSampleRate = 0;
 						return false;
 					}
@@ -424,15 +644,25 @@ namespace
 						{
 							std::cerr << boost::format ("\"%s\".txFrequency = \"%16.12e\". Local oscillator failed to lock.\n") % _deviceArgs % txFrequency.value();
     						txFrequency = 0;
-							return false;
+    						if (requireLock)
+    							return false;
+    						else
+    							break;
 						}
 					}
 				}
 				return true;
 			}
 			
-			bool ConfigureRx ()
+			bool ConfigureRx (bool requireLock)
 			{
+				if (rxNeedToSetSubdevices)
+				{
+					assert(usrp->get_rx_num_channels() == 2);
+					usrp->set_rx_subdev_spec(uhd::usrp::subdev_spec_t("A:0 A:0"));		// Two channels so we can get at the 2nd one for 100 Msps.
+					rxNeedToSetSubdevices = false;
+				}
+
 				bool	frequencyChanged = rxFrequency.changed() || rxOffset.changed();
 				if (frequencyChanged)
 				{
@@ -442,35 +672,43 @@ namespace
 						std::cout << boost::format ("\"%s\".rxOffset = \"%16.12e\"\n") % _deviceArgs % rxOffset.value();
 					}
  					
-					uhd::tune_result_t tuneResult = usrp->set_rx_freq(uhd::tune_request_t(rxFrequency.value(), rxOffset.value()));
-
-  					if (_verbose)
-						std::cerr << boost::format ("\"%s\".tuneResult = %s\n") % _deviceArgs % tuneResult.to_pp_string();
-
-    				double actualFrequency = round(usrp->get_rx_freq());
-    				if (fabs(actualFrequency - round(rxFrequency)) > 15)
-    				{
-						std::cerr << boost::format ("\"%s\".rxFrequency = %16.12e unsupported, replaced with %16.12e\n") % _deviceArgs % rxFrequency % actualFrequency;
-    					rxFrequency = 0;
-    					return false;
-    				}
+ 					uhd::tune_request_t		tune_request(rxFrequency.value(), rxOffset.value());
+ 					
+ 					for (size_t channel = 0; channel < 2; ++channel)
+ 					{
+						uhd::tune_result_t tuneResult = usrp->set_rx_freq(tune_request, channel);
+	
+						if (_verbose)
+							std::cerr << boost::format ("\"%s\".tuneResult(%d) = %s\n") % _deviceArgs % channel % tuneResult.to_pp_string();
+	
+						double actualFrequency = boost::math::round(usrp->get_rx_freq());
+						if (fabs(actualFrequency - boost::math::round(rxFrequency.value())) > 15)
+						{
+							std::cerr << boost::format ("\"%s\".rxFrequency = %16.12e unsupported, replaced with %16.12e\n") % _deviceArgs % rxFrequency.value() % actualFrequency;
+							rxFrequency = 0;
+							return false;
+						}
+ 					}
     			}
     			
 				if (rxGain.changed())
 				{
 					double gain = rxGain.value();
 					if (gain == unspecified)
-						gain = MiddleOfRange(usrp->get_rx_gain_range());
+						gain = MiddleOfRange(usrp->get_rx_gain_range(0));
 					if (_verbose)
 						std::cout << boost::format ("\"%s\".rxGain = %g\n") % _deviceArgs % gain;
    					
-					usrp->set_rx_gain(gain);
-					if (fabs(usrp->get_rx_gain() - gain) > 0.05)
-					{
-						std::cerr << boost::format ("\"%s\".rxGain = %g unsupported, replaced with %g\n") % _deviceArgs % gain % usrp->get_rx_gain();
-						rxGain = 0;
-						return false;
-					}
+ 					for (size_t channel = 0; channel < 2; ++channel)
+ 					{
+						usrp->set_rx_gain(gain, channel);
+						if (fabs(usrp->get_rx_gain(channel) - gain) > 0.05)
+						{
+							std::cerr << boost::format ("\"%s\".rxGain = %g unsupported, replaced with %g\n") % _deviceArgs % gain % usrp->get_rx_gain();
+							rxGain = 0;
+							return false;
+						}
+ 					}
 				}
 
 				if (rxBandwidth.changed())
@@ -481,7 +719,8 @@ namespace
 						if (_verbose)
 							std::cout << boost::format ("\"%s\".rxBandwidth = %g\n") % _deviceArgs % bandwidth;
 						
-						usrp->set_rx_bandwidth(bandwidth);
+	 					for (size_t channel = 0; channel < 2; ++channel)
+							usrp->set_rx_bandwidth(bandwidth, channel);
 					}
 				}
 
@@ -491,16 +730,20 @@ namespace
 						std::cout << boost::format ("\"%s\".rxSampleRate = %26.14g\n") % _deviceArgs % rxSampleRate.value();
    					
 					if (rxSampleRate == 100e6)
-    					usrp->set_rx_rate(100e6/4);	// Must be using custom N210 FPGA
+					{
+    					usrp->set_rx_rate(100e6/4, 1);	// Must be using custom N210 FPGA
+    					usrp->set_rx_rate(100e6/4, 0);
+    				}
 					else
 					{
-    					usrp->set_rx_rate(rxSampleRate);
+    					usrp->set_rx_rate(rxSampleRate, 0);
+    					usrp->set_rx_rate(rxSampleRate, 1);		// Not actually used.
     					
-    					double		actualSampleRate = usrp->get_rx_rate();
+    					double		actualSampleRate = usrp->get_rx_rate(0);
 						if (fabs(actualSampleRate - rxSampleRate) > 1e-6)
 						{
 							std::cerr << boost::format ("\"%s\".rxSampleRate = %26.14g unsupported, replaced with %26.14g, differs by %26.14g\n") 
-														% _deviceArgs % rxSampleRate % actualSampleRate % (actualSampleRate - rxSampleRate);
+														% _deviceArgs % rxSampleRate.value() % actualSampleRate % (actualSampleRate - rxSampleRate);
     						rxSampleRate = 0;
     						return false;
     					}
@@ -517,7 +760,10 @@ namespace
 						{
 							std::cerr << boost::format ("\"%s\".rxFrequency = \"%16.12e\". Local oscillator failed to lock.\n") % _deviceArgs % rxFrequency.value();
     						rxFrequency = 0;
-							return false;
+    						if (requireLock)
+    							return false;
+    						else
+    							break;
 						}
 					}
 				}
@@ -543,38 +789,30 @@ namespace
 			 ,	_synchronized (false)
 			{}
 			
-			ManagedUsrp::sptr GetUsrp (std::string deviceName, bool fullRate, std::string clockSource, std::ostream &output)
+			void clear ()
+			{
+				_devices.clear();
+				_usePPS = false;
+				_synchronized = false;
+			}
+			
+			ManagedUsrp::sptr GetUsrp (std::string deviceName, bool closeWhenUnused, std::string clockSource, std::ostream &output)
 			{
 				DeviceMap::iterator			existingDevice = _devices.find(deviceName);
 				ManagedUsrp::sptr			managedUsrp;
 				
-				if (existingDevice != _devices.end())
-				{
-					bool	previousFullRate = existingDevice->second->rxSampleRate == 100e6;
-					if (fullRate != previousFullRate)
-					{
-						_devices.erase(existingDevice);
-						existingDevice = _devices.end();
-					}
-				}
-				
 				if (existingDevice == _devices.end())
 				{
-					// UHD_SWAP_RX_DSPS is used in uhd/lib/usrp/usrp2/usrp2_impl.cpp
-					int result = fullRate ? putenv("UHD_SWAP_RX_DSPS=1") : putenv("UHD_SWAP_RX_DSPS=0");
-					if (result != 0)
-						std::cerr << boost::format ("putenv return error %s\n") % strerror(errno);
-					
-					uhd::usrp::single_usrp::sptr usrp;
+					uhd::usrp::multi_usrp::sptr usrp;
 					try
 					{
-						usrp = uhd::usrp::single_usrp::make(deviceName);
+						usrp = uhd::usrp::multi_usrp::make(deviceName);
 						if (usrp)
 						{
 							if (_verbose)
-								std::cout << boost::format ("Adding \"%s\", fullRate %d\n") % deviceName % fullRate;
+								std::cout << boost::format ("Adding \"%s\"\n") % deviceName;
 							
-							managedUsrp = ManagedUsrp::sptr(new ManagedUsrp(_verbose, usrp, deviceName));
+							managedUsrp = ManagedUsrp::sptr(new ManagedUsrp(_verbose, usrp, deviceName, closeWhenUnused));
 							_devices[deviceName] = managedUsrp;
 							_synchronized = false;
 						}
@@ -587,9 +825,10 @@ namespace
 				else
 				{
 					if (_verbose)
-						std::cout << boost::format ("Reusing \"%s\", fullRate %d\n") % deviceName % fullRate;
+						std::cout << boost::format ("Reusing \"%s\"\n") % deviceName;
 					
 					managedUsrp = existingDevice->second;
+					managedUsrp->inUseThisTime = true;
 				}
 				managedUsrp->clockSource = clockSource;
 				if (managedUsrp->clockSource.changed())
@@ -624,6 +863,30 @@ namespace
 				}
 			}
 
+			void StartNewRun ()
+			{
+				DeviceMap::iterator	i = _devices.end();
+				for (i = _devices.begin(); i != _devices.end(); ++i)
+					i->second->inUseThisTime = false;
+			}
+			
+			void CloseUnusedDevicesIfRequired ()
+			{
+				while (true)
+				{
+					DeviceMap::iterator	usrpToDelete = _devices.end();
+					for (usrpToDelete = _devices.begin(); usrpToDelete != _devices.end(); ++usrpToDelete)
+					{
+						if (usrpToDelete->second->_closeWhenUnused && !usrpToDelete->second->inUseThisTime)
+							break;
+					}
+					if (usrpToDelete == _devices.end())
+						break;
+					
+					_devices.erase(usrpToDelete);
+				}
+			}
+			
 		private:
 			void ZeroAllTimesAtNextPPS ()
 			{
@@ -735,7 +998,7 @@ namespace
 	  		free(_buffer);
 	  	}
 	  	
-		bool LoadFile (std::string filePath, std::ostream &errorOutput)
+		bool LoadFile (std::string filePath, double minimumSeconds, std::ostream &errorOutput)
 		{
 			FILE	       *file = fopen(filePath.data(), "rb");
 			if (file == NULL)
@@ -751,35 +1014,54 @@ namespace
 				return false;
 			}
 			
-			long		numBytes = ftell (file);
-			if (numBytes < 0)
+			long		numBytesInFile = ftell (file);
+			if (numBytesInFile < 0)
 			{
 				errorOutput << boost::format ("Error %s ftell %s") % strerror(errno) % filePath.data() << std::endl;
 				fclose(file);
 				return false;
 			}
-			rewind (file);
+			size_t		numSamplesInFile = numBytesInFile/sizeof(uint32_t);
 			
-			size_t		numSamples = numBytes/sizeof(uint32_t);
+			size_t		minimumSamples;
 			
+			if (minimumSeconds == unspecified)
+				minimumSamples = 1024*1024*1;
+			else
+				minimumSamples = (size_t) (minimumSeconds * _usrp->txSampleRate);
+			
+			size_t		numSamplesToBuffer;
+			if (numSamplesInFile >= minimumSamples)
+				numSamplesToBuffer = numSamplesInFile;
+			else
+				numSamplesToBuffer = ((minimumSamples/numSamplesInFile)+1) * numSamplesInFile;
+				
 			free(_buffer);
-			_numSamplesInBuffer = numSamples;
-			_buffer = (uint32_t*) calloc(numSamples, sizeof(uint32_t));
+			_numSamplesInBuffer = numSamplesToBuffer;
+			_buffer = (uint32_t*) calloc(numSamplesToBuffer, sizeof(uint32_t));
 			
-			size_t		readSoFar = 0;
-			while (readSoFar < numSamples)
+			size_t		numSamplesBuffered = 0;
+			
+			while (numSamplesBuffered < numSamplesToBuffer)
 			{
-				size_t readThisTime = fread(&_buffer[readSoFar], sizeof(_buffer[0]), numSamples-readSoFar, file);
-				if (readThisTime == 0)
+				rewind (file);
+				
+				size_t		readSoFar = 0;
+				while (readSoFar < numSamplesInFile)
 				{
-					int error = ferror(file);
-					if (error == EINTR)
-						continue;
-						
-					fclose(file);
-					return false;
+					size_t readThisTime = fread(&_buffer[numSamplesBuffered+readSoFar], sizeof(_buffer[0]), numSamplesInFile-readSoFar, file);
+					if (readThisTime == 0)
+					{
+						int error = ferror(file);
+						if (error == EINTR)
+							continue;
+							
+						fclose(file);
+						return false;
+					}
+					readSoFar -= readThisTime;
 				}
-				readSoFar -= readThisTime;
+				numSamplesBuffered = numSamplesBuffered + numSamplesInFile;
 			}
 			fclose(file);
 	
@@ -817,6 +1099,9 @@ namespace
 			
 			EnableRealtimeScheduling ();
 			
+		    uhd::stream_args_t stream_args("sc16");
+		    uhd::tx_streamer::sptr tx_stream = _usrp->usrp->get_tx_stream(stream_args);
+
 			uhd::tx_metadata_t	metadata;
 			
 			metadata.start_of_burst = true;
@@ -828,7 +1113,7 @@ namespace
 			{
 				assert(numSamples > 0);
 				
-				if (_stopTransmitting || gotSIGINT || gotSIGHUP)
+				if (_stopTransmitting || gotSIGINT)
 					numSamples = 1;	// Zero makes more sense, but UHD sometimes sends 1 anyway, triggering the WARNING below.
 				
 				size_t numToSend = _numSamplesInBuffer;
@@ -844,10 +1129,7 @@ namespace
 											% metadata.time_spec.get_real_secs() 
 											% (metadata.time_spec + uhd::time_spec_t(0, numToSend, _usrp->txSampleRate)).get_real_secs() << std::endl;
 
-				size_t numSent = _usrp->usrp->get_device()->send(_buffer, numToSend, metadata, 
-																	uhd::io_type_t::COMPLEX_INT16, 
-																	uhd::device::SEND_MODE_FULL_BUFF,
-																	timeoutInSeconds + 0.1);
+				size_t numSent = tx_stream->send(_buffer, numToSend, metadata, timeoutInSeconds + 0.5);
 				if (numSent != numToSend)
 				{
 					std::cerr << boost::format ("WARNING: %d samples sent out of %d requested.\n") % numSent % numToSend;
@@ -878,6 +1160,7 @@ namespace
 	  private:
 	  	ManagedUsrp::sptr					_usrp;
 	  	long								_delayMultiple;
+	  	bool								_continuous;
 		size_t								_numSamplesInBuffer;
 		size_t								_numSamplesReceived;
 		uint32_t*							_buffer;	// Cheaper than std::vector<std::complex<int16_t>>
@@ -890,7 +1173,8 @@ namespace
 		Receiver(ManagedUsrp::sptr managedUsrp, double sampleTime, long delayMultiple)
 		: _usrp(managedUsrp)
 		, _delayMultiple(delayMultiple)
-		, _numSamplesInBuffer(sampleTime * managedUsrp->rxSampleRate)
+		, _continuous(sampleTime == unspecified)
+		, _numSamplesInBuffer(_continuous ? 1024*1024*32 : static_cast<size_t>(sampleTime * managedUsrp->rxSampleRate))
 		, _numSamplesReceived(0)
 		, _buffer((uint32_t*) calloc(_numSamplesInBuffer, sizeof(uint32_t)))
 	  	, _thread()
@@ -909,7 +1193,7 @@ namespace
  			
 			if (_usrp->rxSampleRate == 100e6)
 			{
-				size_t	maxSamples = pow(2.0, 18);	// The size of the N210's SRAM in samples.
+				size_t	maxSamples = 1 << 18;	// The size of the N210's SRAM in samples.
 			
 				if (_delayMultiple != 0)
 				{
@@ -928,9 +1212,6 @@ namespace
 		
 		void Start (uhd::time_spec_t startingTime, std::ostream *errorOutput, double timeoutInSeconds)
 		{
-    		// Must issue streamCommand before starting to transmit. Otherwise, transmit flow control
-    		// makes it very difficult to get the necessary responses.	@@@ May not be true with latest UHD code.
-    		//
  			size_t	numSamplesToReceive = NumSamplesToReceiveThisTime();
    		
 			if (false)
@@ -941,14 +1222,8 @@ namespace
 											% startingTime.get_real_secs() 
 											% (startingTime + uhd::time_spec_t(0, numSamplesToReceive, _usrp->rxSampleRate)).get_real_secs() << std::endl;
 											
-			uhd::stream_cmd_t streamCommand(uhd::stream_cmd_t::STREAM_MODE_NUM_SAMPS_AND_DONE);
-			streamCommand.num_samps = numSamplesToReceive;
-			streamCommand.stream_now = false;
-			streamCommand.time_spec = startingTime;
-			_usrp->usrp->issue_stream_cmd(streamCommand);
-
 	  		_receiveResult = kReceiveNotFinished;
-			_thread = boost::thread(boost::bind(&Receiver::Receive, this, numSamplesToReceive, errorOutput, timeoutInSeconds));
+			_thread = boost::thread(boost::bind(&Receiver::Receive, this, startingTime, numSamplesToReceive, errorOutput, timeoutInSeconds));
 		}
 		
 		ReceiveResult Wait ()
@@ -957,56 +1232,96 @@ namespace
 			return _receiveResult;
 		}
 
-		void Receive (size_t numSamplesToReceive, std::ostream *errorOutput, double timeoutInSeconds)
+		void Receive (uhd::time_spec_t startingTime, size_t numSamplesToReceive, std::ostream *errorOutput, double timeoutInSeconds)
 		{
 			EnableRealtimeScheduling ();
 			
 			uhd::rx_metadata_t metadata;
-				
-			size_t numReceived = _usrp->usrp->get_device()->recv(_buffer + _numSamplesReceived, numSamplesToReceive, metadata,
-																 uhd::io_type_t::COMPLEX_INT16, uhd::device::RECV_MODE_FULL_BUFF,
-																 timeoutInSeconds + 0.1);
-			_numSamplesReceived = _numSamplesReceived + numReceived;
-
-			switch (metadata.error_code)
-			{
-			  case uhd::rx_metadata_t::ERROR_CODE_NONE:
-				break;
-			  case uhd::rx_metadata_t::ERROR_CODE_OVERFLOW:
-				_receiveResult = kReceiveDataMissing;
-				std::cerr << boost::format("Rx got overrun") << std::endl;
-				*errorOutput << boost::format("Rx got overrun") << std::endl;
-				break;
-			  case uhd::rx_metadata_t::ERROR_CODE_TIMEOUT:
-				_receiveResult = kReceiveDataMissing;
-				std::cerr << boost::format("Rx timeout") << std::endl;
-				*errorOutput << boost::format("Rx timeout") << std::endl;
-				break;
-			  case uhd::rx_metadata_t::ERROR_CODE_LATE_COMMAND:
-				_receiveResult = kReceiveDataMissing;
-				std::cerr << boost::format("Rx late command") << std::endl;
-				*errorOutput << boost::format("Rx late command") << std::endl;
-				break;
-			  default:
-				_receiveResult = kReceiveFailed;
-				std::cerr << boost::format("Rx got error code 0x%x")  % metadata.error_code << std::endl;
-				*errorOutput << boost::format("Rx got error code 0x%x")  % metadata.error_code << std::endl;
-				break;
-			}
-			assert(!metadata.more_fragments);
 			
-			if (numReceived == numSamplesToReceive)
+		    uhd::stream_args_t stream_args("sc16","sc16");
+		    
+		    size_t channel = _usrp->rxSampleRate == 100e6 ? 1 : 0;	// Tells custom N210 FPGA to use the undecimated path or not.
+		    stream_args.channels.push_back(channel);
+		    	
+			uhd::rx_streamer::sptr rx_stream = _usrp->usrp->get_rx_stream(stream_args);
+
+			uhd::stream_cmd_t streamCommand(_continuous ? uhd::stream_cmd_t::STREAM_MODE_START_CONTINUOUS 
+														: uhd::stream_cmd_t::STREAM_MODE_NUM_SAMPS_AND_DONE);
+			if (!_continuous)
+				streamCommand.num_samps = numSamplesToReceive;
+			streamCommand.stream_now = false;
+			streamCommand.time_spec = startingTime;
+			
+			_usrp->usrp->issue_stream_cmd(streamCommand, channel);
+
+			while (!gotSIGINT)
 			{
-				if (_receiveResult == kReceiveNotFinished)
-					_receiveResult = kReceiveSuccessful;
+				size_t numReceived = rx_stream->recv(_buffer + _numSamplesReceived, numSamplesToReceive, metadata,
+																	 timeoutInSeconds + 0.5);
+				if (!_continuous)
+					_numSamplesReceived = _numSamplesReceived + numReceived;
+	
+				switch (metadata.error_code)
+				{
+				  case uhd::rx_metadata_t::ERROR_CODE_NONE:
+					break;
+				  case uhd::rx_metadata_t::ERROR_CODE_OVERFLOW:
+					_receiveResult = kReceiveDataMissing;
+					std::cerr << boost::format("Rx ERROR_CODE_OVERFLOW") << std::endl;
+					*errorOutput << boost::format("Rx ERROR_CODE_OVERFLOW") << std::endl;
+					break;
+				  case uhd::rx_metadata_t::ERROR_CODE_TIMEOUT:
+					_receiveResult = kReceiveFailed;
+					std::cerr << boost::format("Rx ERROR_CODE_TIMEOUT") << std::endl;
+					*errorOutput << boost::format("Rx ERROR_CODE_TIMEOUT") << std::endl;
+					break;
+				  case uhd::rx_metadata_t::ERROR_CODE_LATE_COMMAND:
+					_receiveResult = kReceiveFailed;
+					std::cerr << boost::format("Rx ERROR_CODE_LATE_COMMAND") << std::endl;
+					*errorOutput << boost::format("Rx ERROR_CODE_LATE_COMMAND") << std::endl;
+					break;
+				  case uhd::rx_metadata_t::ERROR_CODE_BROKEN_CHAIN:
+					_receiveResult = kReceiveFailed;
+					std::cerr << boost::format("Rx ERROR_CODE_BROKEN_CHAIN") << std::endl;
+					*errorOutput << boost::format("Rx ERROR_CODE_BROKEN_CHAIN") << std::endl;
+					break;
+				  case uhd::rx_metadata_t::ERROR_CODE_ALIGNMENT:
+					_receiveResult = kReceiveFailed;
+					std::cerr << boost::format("Rx ERROR_CODE_ALIGNMENT") << std::endl;
+					*errorOutput << boost::format("Rx ERROR_CODE_ALIGNMENT") << std::endl;
+					break;
+				  case uhd::rx_metadata_t::ERROR_CODE_BAD_PACKET:
+					_receiveResult = kReceiveFailed;
+					std::cerr << boost::format("Rx ERROR_CODE_BAD_PACKET") << std::endl;
+					*errorOutput << boost::format("Rx ERROR_CODE_BAD_PACKET") << std::endl;
+					break;
+				  default:
+					_receiveResult = kReceiveFailed;
+					std::cerr << boost::format("Rx got unknown error code 0x%x")  % metadata.error_code << std::endl;
+					*errorOutput << boost::format("Rx got unknown error code 0x%x")  % metadata.error_code << std::endl;
+					break;
+				}
+				assert(!metadata.more_fragments);
+				
+				if (!_continuous || _receiveResult != kReceiveNotFinished)
+				{
+					if (numReceived == numSamplesToReceive)
+					{
+						if (_receiveResult == kReceiveNotFinished)
+							_receiveResult = kReceiveSuccessful;
+					}
+					else
+					{
+						std::cerr << boost::format("Rx received %d samples out of %d requested")  % numReceived % numSamplesToReceive << std::endl;
+						*errorOutput << boost::format("Rx received %d samples out of %d requested")  % numReceived % numSamplesToReceive << std::endl;
+						if (_receiveResult == kReceiveNotFinished)
+							_receiveResult = kReceiveDataMissing;	// Do it over.
+					}
+					break;
+				}
 			}
-			else
-			{
-				std::cerr << boost::format("Rx received %d samples out of %d requested")  % numReceived % numSamplesToReceive << std::endl;
-				*errorOutput << boost::format("Rx received %d samples out of %d requested")  % numReceived % numSamplesToReceive << std::endl;
-				if (_receiveResult == kReceiveNotFinished)
-					_receiveResult = kReceiveDataMissing;	// Do it over.
-			}
+			if (_continuous)
+				_usrp->usrp->issue_stream_cmd(uhd::stream_cmd_t(uhd::stream_cmd_t::STREAM_MODE_STOP_CONTINUOUS));
 		}
 		
 		bool writeSamples (FILE *file)
@@ -1042,6 +1357,7 @@ namespace
 		std::string			clockSource;
 		std::string			antenna;
 		std::string			filePath;
+		bool				closeWhenUnused;
 
 		bool Validate (std::string name, std::ostream &output)
 		{
@@ -1074,6 +1390,10 @@ namespace
 	
 	struct Options
 	{
+		po::variables_map 			vm;
+
+		bool						listDevices;
+		
 		DeviceOptions				t1;
 		DeviceOptions				t2;
 		DeviceOptions				rx;
@@ -1081,9 +1401,11 @@ namespace
 		double						rxSeconds;
 		double						rxDelay;
 		double						delay;
+		double						ppsOffset;
 		long						delayMultiple;
 		double						clientWaitTime;
 		bool						synchronize;
+		bool						requireLock;
 		bool 						verbose;
 		bool						server;
 		bool						client;
@@ -1101,6 +1423,11 @@ namespace
 			description.add_options()
 				("help", "help message")
 				
+				("version", "print the version string and exit")
+				("list", "list devices")
+				("tree", "print a complete property tree of each device")
+       			("string", po::value<std::string>(), "query a string value from the properties tree of each device")
+
 				("server", "Become server process.")
 				("client", "Route request to server process.")
 	
@@ -1113,6 +1440,7 @@ namespace
 				("t1Clock", po::value<std::string>(&t1.clockSource)->default_value("INT"), "Source of transmitter 1's reference clock and PPS (INT, EXT)")
 				("t1Antenna", po::value<std::string>(&t1.antenna)->default_value(""), "Antenna to use for transmitter 1")
 				("t1File", po::value<std::string>(&t1.filePath)->default_value(""), "File with data to transmit for transmitter 1")
+				("t1Close", po::value<bool>(&t1.closeWhenUnused)->default_value(false), "Close transmitter 1 device when not in use.")
 	
 				("t2Device", po::value<std::string>(&t2.device)->default_value(""), "Transmitter 2 uhd device address args")
 				("t2Frequency", po::value<double>(&t2.centerFrequency)->default_value(unspecified), "Rf center frequency in Hz for transmitter 2")
@@ -1123,6 +1451,7 @@ namespace
 				("t2Clock", po::value<std::string>(&t2.clockSource)->default_value("INT"), "Source of transmitter 2's reference clock and PPS (INT, EXT)")
 				("t2Antenna", po::value<std::string>(&t2.antenna)->default_value(""), "Antenna to use for transmitter 2")
 				("t2File", po::value<std::string>(&t2.filePath)->default_value(""), "File with data to transmit for transmitter 2")
+				("t2Close", po::value<bool>(&t2.closeWhenUnused)->default_value(false), "Close transmitter 2 device when not in use.")
 	
 				("rxDevice", po::value<std::string>(&rx.device)->default_value(""), "Receiver uhd device address args")
 				("rxFrequency", po::value<double>(&rx.centerFrequency)->default_value(unspecified), "Rf center frequency in Hz for receiver")
@@ -1134,20 +1463,25 @@ namespace
 				("rxClock", po::value<std::string>(&rx.clockSource)->default_value("INT"), "Source of receiver's reference clock and PPS (INT, EXT)")
 				("rxAntenna", po::value<std::string>(&rx.antenna)->default_value(""), "Antenna to use for receiver")
 				("rxFile", po::value<std::string>(&rx.filePath)->default_value(""), "File to store received data")
+				("rxClose", po::value<bool>(&rx.closeWhenUnused)->default_value(false), "Close receiver device when not in use.")
 	
-				("rxSeconds", po::value<double>(&rxSeconds)->default_value(0.25), "number of seconds to receive")
+				("rxSeconds", po::value<double>(&rxSeconds)->default_value(unspecified), "number of seconds to receive")
 				("synchronize", po::value<bool>(&synchronize)->default_value(false), "Synchronize transmit and receive times")
 				("verbose", po::value<bool>(&verbose)->default_value(false), "Verbose output")
-				("delay", po::value<double>(&delay)->default_value(0.02), "Receive, transmit delay for synchronization in seconds.")
+				("delay", po::value<double>(&delay)->default_value(0.07), "Receive, transmit delay for synchronization in seconds.")
+				("ppsOffset", po::value<double>(&ppsOffset)->default_value(unspecified), "Align transmission relative to next PPS.")
 				("delayMultiple", po::value<long>(&delayMultiple)->default_value(0), "Required delay multiple in sample clock ticks to keep samples in phase across receives.")
 				("rxDelay", po::value<double>(&rxDelay)->default_value(0.0), "Extra receive delay for synchronization in seconds.")
 				("waitTime", po::value<double>(&clientWaitTime)->default_value(unspecified), "(Internal) Time client spent waiting for access in seconds.")
+
+				("require-lock", po::value<bool>(&requireLock)->default_value(true), "Require local oscillator lock.")
 				;
 				
-			po::variables_map vm;
 			po::store(po::parse_command_line(argc, argv, description), vm);
 			po::notify(vm);
 		
+			listDevices = vm.count("list") || vm.count("string")  || vm.count("tree");
+			
 			server = vm.count("server") > 0;
 			client = vm.count("client") > 0;
 			help = vm.count("help") > 0;
@@ -1162,27 +1496,47 @@ namespace
 			
 			bool	optionsAreValid = true;
 			
+#if CLIENT_SERVER
 			if (server && client)
 			{
-				output << "Can't be both --client and --server." << std::endl;
+				output << "Choose only one of --server, --client." << std::endl;
 				optionsAreValid = false;
 			}
-			
-			optionsAreValid &= t1.Validate("t1", output);
-			optionsAreValid &= t2.Validate("t2", output);
-			optionsAreValid &= rx.Validate("rx", output);
-			if (!server && t1.device.length() == 0 && t2.device.length() ==0  && rx.device.length() == 0)
+#else
+			if (server || client)
 			{
-				output << "Need to specify at least one of --t1Device, --t2Device, --rxDevice." << std::endl;
+				output << "Neither --server or --client are support on this platform." << std::endl;
+				optionsAreValid = false;
+			}
+#endif
+			
+			if (server + vm.count("list") + vm.count("string") + vm.count("tree") + vm.count("version") > 1)
+			{
+				output << "Choose only one of --server, --list, --tree, or --string." << std::endl;
 				optionsAreValid = false;
 			}
 			
+			if (!listDevices && !vm.count("version"))
+			{
+				optionsAreValid &= t1.Validate("t1", output);
+				optionsAreValid &= t2.Validate("t2", output);
+				optionsAreValid &= rx.Validate("rx", output);
+				if (!server && t1.device.length() == 0 && t2.device.length() ==0  && rx.device.length() == 0)
+				{
+					output << "Need to specify at least one of --t1Device, --t2Device, --rxDevice." << std::endl;
+					optionsAreValid = false;
+				}
+			}
+	
 			return optionsAreValid;
 		}
 	};	
-		
+
 	bool WriteSamples (std::string filePath, Receiver::sptr receiver, std::ostream &errorOutput)
 	{
+		if (filePath.empty())
+			return true;
+			
 		FILE	       *file = fopen(filePath.data(), "wb");
 		if (file == NULL)
 		{
@@ -1201,6 +1555,8 @@ namespace
 
 	CommandResults TransmitTransmitReceive (UsrpCache &usrpCache, Options options, std::ostream &output)
 	{
+		CommandResults result = kCommandSuccess;
+			
 		ManagedUsrp::sptr	t1;
 		ManagedUsrp::sptr	t2;
 		ManagedUsrp::sptr	rx;
@@ -1209,9 +1565,14 @@ namespace
 		Transmitter::sptr 	transmitter2;
 		Receiver::sptr 		receiver;
 		
+		double minimumTxSeconds = options.rxSeconds;
+		if (minimumTxSeconds != unspecified && options.rxDelay != unspecified)
+			minimumTxSeconds = minimumTxSeconds + options.rxDelay;
+		
+		usrpCache.StartNewRun ();
 		if (options.t1.device.length() > 0)
 		{
-			t1 = usrpCache.GetUsrp (options.t1.device, false, options.t1.clockSource, output);
+			t1 = usrpCache.GetUsrp (options.t1.device, options.t1.closeWhenUnused, options.t1.clockSource, output);
 			if (!t1)
 				return kCommandUsrpNotFoundError;
 			
@@ -1222,11 +1583,11 @@ namespace
 			t1->txBandwidth = options.t1.bandwidth;
 			t1->txSampleRate = options.t1.sampleRate;
 
-			if (!t1->ConfigureTx())
+			if (!t1->ConfigureTx(options.requireLock))
 				return kCommandUsrpConfigError;
 			
 			transmitter1 = Transmitter::sptr(new Transmitter(t1));
-			if (!transmitter1->LoadFile (options.t1.filePath, output))
+			if (!transmitter1->LoadFile (options.t1.filePath, minimumTxSeconds, output))
 				return kCommandFileError;
 			
 			if (options.verbose)
@@ -1238,7 +1599,7 @@ namespace
 		
 		if (options.t2.device.length() > 0)
 		{
-			t2 = usrpCache.GetUsrp (options.t2.device, false, options.t2.clockSource, output);
+			t2 = usrpCache.GetUsrp (options.t2.device, options.t2.closeWhenUnused, options.t2.clockSource, output);
 			if (!t2)
 				return kCommandUsrpNotFoundError;
 			
@@ -1249,11 +1610,11 @@ namespace
 			t2->txBandwidth = options.t2.bandwidth;
 			t2->txSampleRate = options.t2.sampleRate;
 
-			if (!t2->ConfigureTx())
+			if (!t2->ConfigureTx(options.requireLock))
 				return kCommandUsrpConfigError;
 			
 			transmitter2 = Transmitter::sptr(new Transmitter(t2));
-			if (!transmitter2->LoadFile (options.t2.filePath, output))
+			if (!transmitter2->LoadFile (options.t2.filePath, minimumTxSeconds, output))
 				return kCommandFileError;
 			
 			if (options.verbose)
@@ -1265,7 +1626,7 @@ namespace
 		
 		if (options.rx.device.length() > 0)
 		{
-			rx = usrpCache.GetUsrp (options.rx.device, options.rx.sampleRate == 100e6, options.rx.clockSource, output);
+			rx = usrpCache.GetUsrp (options.rx.device, options.rx.closeWhenUnused, options.rx.clockSource, output);
 			if (!rx)
 				return kCommandUsrpNotFoundError;
 			
@@ -1277,7 +1638,7 @@ namespace
 			rx->rxBandwidth = options.rx.bandwidth;
 			rx->rxSampleRate = options.rx.sampleRate;
 
-			if (!rx->ConfigureRx())
+			if (!rx->ConfigureRx(options.requireLock))
 				return kCommandUsrpConfigError;
 			
 			receiver = Receiver::sptr(new Receiver(rx, options.rxSeconds, options.delayMultiple));
@@ -1290,18 +1651,23 @@ namespace
 		}
 		assert (t1 || t2 || rx);
 		
+		usrpCache.CloseUnusedDevicesIfRequired ();
+
 		int numSynchronizing = (t1 && t1->usingExternalClock)
 							 + (t2 && t2->usingExternalClock)
 							 + (rx && rx->usingExternalClock);
 		
-		bool synchronize = options.synchronize && (numSynchronizing > 1);
+		bool synchronize = options.synchronize && (numSynchronizing > 0);
 		
+		if (options.verbose)
+			output << boost::format ("Synchronize:  %d, numSynchronizing: %d, options.synchronize: %d\n") % synchronize % numSynchronizing % options.synchronize << std::endl;
+			
 		usrpCache.SynchronizeClocks (synchronize);
 		
 		int numTries = 0;
 		while (true)
 		{
-			if (gotSIGINT || gotSIGHUP)
+			if (gotSIGINT)
 				return kCommandInterrupted;
 				
 			uhd::time_spec_t 	t1Time;
@@ -1339,6 +1705,19 @@ namespace
 					baseDelay = baseDelay + uhd::time_spec_t (0, extraDelayInTicks, 100e6);
 				}
 				commonTime = commonTime + baseDelay;
+
+				if (options.ppsOffset != unspecified)
+				{
+					uhd::time_spec_t	timeAdjust = -commonTime.get_frac_secs() + 1.0 + options.ppsOffset;
+					commonTime = commonTime + timeAdjust;
+					baseDelay = baseDelay + timeAdjust;		// Used for timeout calculation.
+					
+					if (options.verbose)
+					{
+						output << boost::format ("timeAdjust:  %g\n") % timeAdjust.get_real_secs() << std::endl;
+						output << boost::format ("commonTime:  %g\n") % commonTime.get_real_secs() << std::endl;
+					}
+				}
 				
 				if (t1)
 				{
@@ -1372,13 +1751,7 @@ namespace
 					rxTime = rx->usrp->get_time_now() + baseDelay;
 			}
 
-			// Must start receiver before starting transmitters. If doing full duplex on one USRP2,
-			// transmit flow control will cause timeouts when setting up the receive.
-			// The results should be okay because actual start times are in the future.
-			// @@@ May not be true with latest UHD code.
-			//
-			
-			if (receiver)
+			if (options.rxSeconds != unspecified)
 			{
 				uhd::time_spec_t	rxExtraDelay = uhd::time_spec_t(options.rxDelay) + receiver->NumSecondsAlreadyReceived();
 				uhd::time_spec_t	rxDuration = receiver->NumSecondsToReceiveThisTime();
@@ -1433,10 +1806,13 @@ namespace
 						{
 							if (receiver->NumSamplesStillNeeded() == 0)
 							{
-								if (WriteSamples (options.rx.filePath, receiver, output))
-									return kCommandSuccess;
-								else
+								if (gotSIGINT)
+									return kCommandInterrupted;
+									
+								if (!WriteSamples (options.rx.filePath, receiver, output))
 									return kCommandFileError;
+
+								return kCommandSuccess;
 							}
 							numTries = 0;
 						}
@@ -1458,11 +1834,15 @@ namespace
 			}
 			else
 			{
+				if (receiver)
+					receiver->Start(rxTime, &output, (uhd::time_spec_t(options.delay) + uhd::time_spec_t(options.rxDelay)).get_real_secs());
 				if (transmitter1)
 					transmitter1->Start(t1Time, std::numeric_limits<double>::max(), options.delay);
 				if (transmitter2)
 					transmitter2->Start(t2Time, std::numeric_limits<double>::max(), options.delay);
 				
+				if (receiver)
+					receiver->Wait();
 				if (transmitter1)
 					transmitter1->Wait(&output);
 				if (transmitter2)
@@ -1473,37 +1853,20 @@ namespace
 		}
 	}
 
-	const char*		serverRequestFifoName = "/tmp/uhd_streamer.request";
-	const char*		serverResponseFifoName = "/tmp/uhd_streamer.response";
-	const char*		serverStdoutFifoName = "/tmp/uhd_streamer.stdout";
+#if CLIENT_SERVER
+	const unsigned short	kServerTcpPort		= 	4242;
+	const std::string		kEndString("<end>");
 	
 	CommandResults BecomeServer (Options options)
 	{
-		gotSIGHUP = false;
+	    boost::asio::io_service 		io_service;
 		
-		unlink(serverRequestFifoName);
-		unlink(serverResponseFifoName);
-		unlink(serverStdoutFifoName);
-		
-		if (mkfifo(serverRequestFifoName, 0600) != 0)
-		{
-			std::cerr << boost::format ("mkfifo(%s) failed: %s") % serverRequestFifoName % strerror(errno) << std::endl;
-			return kCommandFifoError;
-		}
-		if (mkfifo(serverResponseFifoName, 0600) != 0)
-		{
-			std::cerr << boost::format ("mkfifo(%s) failed: %s") % serverResponseFifoName % strerror(errno) << std::endl;
-			return kCommandFifoError;
-		}
-		if (mkfifo(serverStdoutFifoName, 0600) != 0)
-		{
-			std::cerr << boost::format ("mkfifo(%s) failed: %s") % serverStdoutFifoName % strerror(errno) << std::endl;
-			return kCommandFifoError;
-		}
-		
+    	boost::asio::ip::tcp::endpoint 		endpoint(boost::asio::ip::tcp::v4(), kServerTcpPort);
+	    boost::asio::ip::tcp::acceptor 		acceptor(io_service, endpoint);
+
 		UsrpCache		usrpCache (options.verbose);
 		
-		while (!gotSIGINT && !gotSIGHUP)
+		while (!gotSIGINT)
 		{
 			try
 			{
@@ -1512,9 +1875,14 @@ namespace
 					
 				TimeOfDay 			startTime;
 				
-				std::ifstream	requestFifo (serverRequestFifoName, std::ifstream::in);
-				if (!requestFifo.good())
-					continue;
+			  	boost::asio::ip::tcp::iostream 	clientStream;
+			 	boost::system::error_code 	error;
+			 	
+			 	// Accept one client at a time to serialize access to the radios.
+			 	//
+			  	acceptor.accept(*clientStream.rdbuf(), error);
+			  	if (error)
+			  		continue;
 				
 				TimeOfDay 			haveClientTime;
 
@@ -1523,38 +1891,50 @@ namespace
 				const bool debugCommunication = options.verbose && false;
 				
 				if (debugCommunication)
-					std::cout << "Client args:";
+					std::cout << "Client args:" << std::endl;
 					
-				while (requestFifo.good())
+				while (clientStream.good())
 				{
-					char			lineBuffer[1024];
+					std::string		argString;
 					
-					requestFifo.getline(lineBuffer, 1024, '\n');
-					args.push_back (std::string(lineBuffer));
+					std::getline(clientStream, argString);
 					if (debugCommunication)
-						std::cout << " " << lineBuffer;
+						std::cout << " " << argString << std::endl;
+
+					if (argString == std::string(kEndString))
+						break;
+						
+					args.push_back (argString);
 				}
-				if (debugCommunication)
-					std::cout << std::endl;
-					
-				std::ofstream	output (serverStdoutFifoName);
-				std::ofstream	responseFifo (serverResponseFifoName);
-
+				
 				TimeOfDay 			haveArgsTime;
-
-				char	*argv[args.size()];
+				
+				std::vector<char*>	argv(args.size());
 				for (unsigned int a = 0; a < args.size(); ++a)
 					argv[a] = const_cast<char*>(args[a].c_str());
 				
-				Options		clientOptions (args.size(), argv, output);
+				Options		clientOptions (argv.size(), &argv[0], clientStream);
 				
 				CommandResults	result;
-				if (clientOptions.Validate(output))
-					result = TransmitTransmitReceive (usrpCache, clientOptions, output);
+				if (clientOptions.Validate(clientStream))
+					if (clientOptions.vm.count("version"))
+					{
+						clientStream << uhd::get_version_string() << std::endl;
+						result = kCommandSuccess;
+					}
+					else if (clientOptions.listDevices)
+					{
+						usrpCache.clear();
+						result = (CommandResults) DeviceLister::ListDevices (clientStream, clientOptions.vm);
+					}
+					else
+					{
+						result = TransmitTransmitReceive (usrpCache, clientOptions, clientStream);
+					}
 				else
 					result = kCommandArgError;
 				
-				responseFifo << (int) result;
+				clientStream << boost::format("\n%s\n%d\n") % kEndString % (int) result;
 				if (debugCommunication)
 					std::cout << "Result: " << (int) result << std::endl;
 				
@@ -1569,17 +1949,14 @@ namespace
 					std::cout << boost::format("    Receive time %10.6f seconds.") % clientOptions.rxSeconds << std::endl;
 				}
 				
-				if (result == kCommandRetryLimitExceededError)
-					break;
+				if (result == kCommandRetryLimitExceededError || result == kCommandUsrpReceiveError)
+					break; // Restart the server
 			}
 			catch (std::runtime_error e)
 			{
 				std::cerr << e.what() << std::endl;
 			}
 		}
-		unlink(serverRequestFifoName);
-		unlink(serverResponseFifoName);
-		unlink(serverStdoutFifoName);
 
 		if (gotSIGINT)
 			return kCommandSuccess;
@@ -1589,65 +1966,62 @@ namespace
 	
 	CommandResults AskServerTo (int argc, char *argv[])
 	{
-		TimeOfDay 			startTime;
+		TimeOfDay 						startTime;
 		
-		boost::interprocess::file_lock radioAccess ("/var/lock/uhd_streamer");	// Must already exist.
-		radioAccess.lock();			// Do this BEFORE EnableRealtimeScheduling.
-	
-		TimeOfDay 			radioAccessTime;
+		boost::asio::ip::tcp::endpoint	endpoint(boost::asio::ip::address_v4::loopback(), kServerTcpPort);
+	    boost::asio::ip::tcp::iostream	serverStream(endpoint);
 		
-		double waitTimeInSeconds = ElapsedTimeInSeconds (startTime, radioAccessTime);
+		double waitTimeInSeconds = ElapsedTimeInSeconds (startTime);
 
 		const bool debugCommunication = false;
 		
 		if (debugCommunication)
 			std::cout << "Client args:";
 			
-		while (true)
+		for (int a = 0; a < argc; ++a)
 		{
-			std::ofstream	requestFifo (serverRequestFifoName);
-	
-			for (int a = 0; a < argc; ++a)
-			{
-				requestFifo << argv[a] << std::endl;
-				if (debugCommunication)
-					std::cout << argv[a] << std::endl;
-			}
-			requestFifo << "--waitTime" << std::endl << waitTimeInSeconds << std::endl;
+			serverStream << argv[a] << std::endl;
 			if (debugCommunication)
-				std::cout << "--waitTime" << std::endl << waitTimeInSeconds << std::endl;
-			
-			if (requestFifo.good())
-				break;
+				std::cout << argv[a] << std::endl;
 		}
+		serverStream << "--waitTime" << std::endl << waitTimeInSeconds << std::endl;
+		serverStream << kEndString << std::endl;
 
-		std::ifstream	stdoutFifo (serverStdoutFifoName);
-		std::ifstream	responseFifo (serverResponseFifoName);
-		while (true)
+		if (debugCommunication)
+			std::cout << "--waitTime" << std::endl << waitTimeInSeconds << std::endl;
+		
+		std::string		outputString;
+		
+		while (serverStream.good())
 		{
-			if (gotSIGINT || gotSIGHUP)
+			if (gotSIGINT)
 				return kCommandInterrupted;
 			
-			char	c = (char) stdoutFifo.get();
-			if (!stdoutFifo.good())
+			std::getline(serverStream, outputString);
+			
+			if (outputString == std::string(kEndString))
 				break;
-			std::cout << c;
+		
+			std::cout << outputString << std::endl;
 		}
 		
+		std::getline(serverStream, outputString);
+		
 		int				result;
- 		responseFifo >> result;
-
+		std::istringstream (outputString) >> result;
+		
 		return (CommandResults) result;
 	}
-	
+#endif
+
 } // private namespace
 
 int UHD_SAFE_MAIN(int argc, char *argv[])
 {
-	install_sig_handler(SIGINT, sig_handler);
-	install_sig_handler(SIGHUP, sig_handler);
+#ifndef _WIN32
 	install_sig_handler(SIGPIPE, sig_handler);
-		
+#endif
+
 	Options		options (argc, argv, std::cout);
 
 	if (!options.Validate(std::cout))
@@ -1655,8 +2029,11 @@ int UHD_SAFE_MAIN(int argc, char *argv[])
 	
 	CommandResults	result;
 
+#if CLIENT_SERVER
 	if (options.server)
 	{
+		install_sig_handler(SIGINT, sig_handler);
+			
 		EnableRealtimeScheduling ();
 
 		while (true)
@@ -1671,18 +2048,30 @@ int UHD_SAFE_MAIN(int argc, char *argv[])
 		result = AskServerTo (argc, argv);
 	}
 	else
+#endif
+
 	{
-		boost::interprocess::file_lock radioAccess ("/var/lock/uhd_streamer");	// Must already exist.
-		radioAccess.lock();			// Do this BEFORE EnableRealtimeScheduling.
-	
-		EnableRealtimeScheduling ();
+		if (options.vm.count("version"))
 		{
-			UsrpCache		usrpCache (options.verbose);
-				
-			result = TransmitTransmitReceive (usrpCache, options, std::cout);
+			std::cout << uhd::get_version_string() << std::endl;
+			result = kCommandSuccess;
+		}
+		else
+		{
+			if (options.listDevices)
+				result = (CommandResults) DeviceLister::ListDevices (std::cout, options.vm);
+			else
+			{
+				EnableRealtimeScheduling ();
+				{
+					UsrpCache		usrpCache (options.verbose);
+						
+					result = TransmitTransmitReceive (usrpCache, options, std::cout);
+				}
+			}
 		}
 	}
 	if (options.verbose)
-		std::cout << boost::format ("Finished with result %d") % result << std::endl;
+		std::cout << boost::format ("Finished with result %d") % (int) result << std::endl;
 	return result;
 }

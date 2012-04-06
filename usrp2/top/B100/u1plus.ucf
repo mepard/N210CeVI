@@ -199,5 +199,5 @@ NET "SCLK_TX_DB"  LOC = "G1"  ;
 #NET "TDI"  LOC = "B1"  ;
 #NET "TCK"  LOC = "A15"  ;
 
-##NET "fpga_cfg_prog_b"  LOC = "A2"  ;
-##NET "fpga_cfg_done"  LOC = "T15"  ;
+#NET "fpga_cfg_prog_b"  LOC = "A2"  ;
+#NET "fpga_cfg_done"  LOC = "T15"  ;
